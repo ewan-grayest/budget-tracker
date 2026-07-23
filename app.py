@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import contextlib
 import hmac
 import html
 import json
@@ -22,12 +23,30 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 SEED_DEMO = os.getenv("SEED_DEMO", "1") == "1"
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+@contextlib.contextmanager
+def db(write=False):
+    # write=True opens a BEGIN IMMEDIATE transaction so that a read-check
+    # followed by a write is atomic against other writers. Without it two
+    # concurrent requests could both pass an "available budget" check and
+    # both commit, overspending the budget (TOCTOU race).
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+    try:
+        if write:
+            conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        if write:
+            conn.execute("COMMIT")
+    except BaseException:
+        if write:
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -95,34 +114,45 @@ def init_db():
             """
         )
         count = conn.execute("SELECT COUNT(*) FROM budget_lines").fetchone()[0]
-        if SEED_DEMO and count == 0:
-            now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            conn.execute(
-                """INSERT INTO budget_lines
-                (code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,currency,
-                 initial_approved_cents,initial_released_cents,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                ("IT-OPS-2026", "IT Operations", 2026, "Budget Holder", "holder@example.com",
-                 "CC-IT", "WBS-IT-OPS", "IT Services", "EUR", 10000000, 10000000, now),
-            )
-            budget_id = conn.execute("SELECT id FROM budget_lines WHERE code='IT-OPS-2026'").fetchone()[0]
-            conn.execute(
-                """INSERT INTO purchase_orders
-                (number,budget_id,vendor,description,amount_cents,status,created_at)
-                VALUES (?,?,?,?,?,?,?)""",
-                ("PO-2026-0001", budget_id, "Example Vendor", "Infrastructure support, limit PO", 2500000, "APPROVED", now),
-            )
-            po_id = conn.execute("SELECT id FROM purchase_orders WHERE number='PO-2026-0001'").fetchone()[0]
-            conn.execute(
-                """INSERT INTO expenses
-                (budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at)
-                VALUES (?,?,?,?,?,?,?)""",
-                (budget_id, po_id, date.today().isoformat(), "INV-DEMO-001", "Monthly support services", 700000, now),
-            )
+    if not (SEED_DEMO and count == 0):
+        return
+    with db(write=True) as conn:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        conn.execute(
+            """INSERT INTO budget_lines
+            (code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,currency,
+             initial_approved_cents,initial_released_cents,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("IT-OPS-2026", "IT Operations", 2026, "Budget Holder", "holder@example.com",
+             "CC-IT", "WBS-IT-OPS", "IT Services", "EUR", 10000000, 10000000, now),
+        )
+        budget_id = conn.execute("SELECT id FROM budget_lines WHERE code='IT-OPS-2026'").fetchone()[0]
+        conn.execute(
+            """INSERT INTO purchase_orders
+            (number,budget_id,vendor,description,amount_cents,status,created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            ("PO-2026-0001", budget_id, "Example Vendor", "Infrastructure support, limit PO", 2500000, "APPROVED", now),
+        )
+        po_id = conn.execute("SELECT id FROM purchase_orders WHERE number='PO-2026-0001'").fetchone()[0]
+        conn.execute(
+            """INSERT INTO expenses
+            (budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (budget_id, po_id, date.today().isoformat(), "INV-DEMO-001", "Monthly support services", 700000, now),
+        )
 
 
 def money_to_cents(value):
-    text = (value or "").strip().replace(" ", "").replace(",", ".")
+    text = (value or "").strip().replace(" ", "").replace("\u00a0", "")
+    # Accept both "1,234.56" and "1.234,56": the rightmost separator is the
+    # decimal point, the other one is a thousands separator and is dropped.
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
     try:
         amount = Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError):
@@ -130,6 +160,27 @@ def money_to_cents(value):
     if amount <= 0:
         raise ValueError("Сумма должна быть больше нуля")
     return int(amount * 100)
+
+
+def parse_int(value, label):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректное значение поля «{label}»")
+
+
+def parse_date(value):
+    try:
+        return date.fromisoformat((value or "").strip()).isoformat()
+    except ValueError:
+        raise ValueError("Некорректная дата")
+
+
+def require(data, field, label):
+    value = (data.get(field) or "").strip()
+    if not value:
+        raise ValueError(f"Поле «{label}» обязательно")
+    return value
 
 
 def fmt_money(cents, currency="EUR"):
@@ -177,6 +228,45 @@ def budget_metrics(conn, budget_id):
 def all_budget_metrics(conn):
     rows = conn.execute("SELECT id FROM budget_lines ORDER BY fiscal_year DESC, code").fetchall()
     return [budget_metrics(conn, r["id"]) for r in rows]
+
+
+def compute_operation_deltas(op, amount, source, target):
+    """Validate a budget operation and return the (approved/released) deltas
+    (source_approved, source_released, target_approved, target_released).
+
+    `source` and `target` are budget_metrics() dicts; `target` is None for
+    non-transfer operations. Raises ValueError on any rule violation. Kept
+    free of I/O so the business rules can be unit-tested in isolation.
+    """
+    sa = sr = ta = tr = 0
+    if op == "SUPPLEMENT":
+        sa = sr = amount
+    elif op == "REDUCTION":
+        if source["released"] - amount < source["actuals"] + source["commitments"]:
+            raise ValueError("Сокращение сделает доступный бюджет отрицательным")
+        sa = sr = -amount
+    elif op == "RELEASE":
+        if source["released"] + amount > source["approved"]:
+            raise ValueError("Release превышает утверждённый бюджет")
+        sr = amount
+    elif op == "RETURN":
+        if source["released"] - amount < source["actuals"] + source["commitments"]:
+            raise ValueError("Нельзя вернуть уже использованный или зарезервированный бюджет")
+        sr = -amount
+    elif op in {"TRANSFER", "CARRY_FORWARD"}:
+        if not target:
+            raise ValueError("Целевой бюджет не найден")
+        if source["row"]["currency"] != target["row"]["currency"]:
+            raise ValueError("Перенос между разными валютами не поддерживается")
+        if source["released"] - amount < source["actuals"] + source["commitments"]:
+            raise ValueError("Недостаточно свободного бюджета для переноса")
+        if op == "CARRY_FORWARD" and target["row"]["fiscal_year"] <= source["row"]["fiscal_year"]:
+            raise ValueError("Carry forward должен идти в более поздний финансовый год")
+        sa = sr = -amount
+        ta = tr = amount
+    else:
+        raise ValueError("Неизвестный тип операции")
+    return sa, sr, ta, tr
 
 
 def esc(value):
@@ -271,6 +361,10 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
         if is_new:
             self.send_header("Set-Cookie", f"csrf_token={token}; Path=/; SameSite=Strict; HttpOnly")
         self.end_headers()
@@ -519,6 +613,10 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_html(self.page("Операции", body))
 
     def create_budget(self, data):
+        code = require(data, "code", "Код")
+        name = require(data, "name", "Название")
+        holder_name = require(data, "holder_name", "Budget Holder")
+        fiscal_year = parse_int(data.get("fiscal_year"), "финансовый год")
         approved = money_to_cents(data.get("approved"))
         released = money_to_cents(data.get("released"))
         if released > approved:
@@ -527,52 +625,31 @@ class AppHandler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[A-Z]{3}", currency):
             raise ValueError("Валюта должна быть трёхбуквенным кодом")
         now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        with db() as conn:
+        with db(write=True) as conn:
             conn.execute(
                 """INSERT INTO budget_lines(code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,currency,initial_approved_cents,initial_released_cents,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (data["code"].strip(), data["name"].strip(), int(data["fiscal_year"]), data["holder_name"].strip(), data.get("holder_email","").strip(), data.get("cost_center","").strip(), data.get("wbs","").strip(), data.get("cost_element","").strip(), currency, approved, released, now),
+                (code, name, fiscal_year, holder_name, data.get("holder_email","").strip(), data.get("cost_center","").strip(), data.get("wbs","").strip(), data.get("cost_element","").strip(), currency, approved, released, now),
             )
         self.redirect("/budgets", "Бюджет создан")
 
     def create_operation(self, budget_id, data):
         op = data.get("operation_type", "").upper()
         amount = money_to_cents(data.get("amount"))
-        target_id = int(data["target_budget_id"]) if data.get("target_budget_id") else None
+        target_id = parse_int(data.get("target_budget_id"), "целевой бюджет") if data.get("target_budget_id") else None
         allowed = {"SUPPLEMENT","REDUCTION","RELEASE","RETURN","TRANSFER","CARRY_FORWARD"}
         if op not in allowed:
             raise ValueError("Неизвестный тип операции")
-        with db() as conn:
+        with db(write=True) as conn:
             source = budget_metrics(conn, budget_id)
             if not source:
                 raise ValueError("Бюджет не найден")
-            sa = sr = ta = tr = 0
-            if op == "SUPPLEMENT": sa = sr = amount
-            elif op == "REDUCTION":
-                if source["released"] - amount < source["actuals"] + source["commitments"]:
-                    raise ValueError("Сокращение сделает доступный бюджет отрицательным")
-                sa = sr = -amount
-            elif op == "RELEASE":
-                if source["released"] + amount > source["approved"]:
-                    raise ValueError("Release превышает утверждённый бюджет")
-                sr = amount
-            elif op == "RETURN":
-                if source["released"] - amount < source["actuals"] + source["commitments"]:
-                    raise ValueError("Нельзя вернуть уже использованный или зарезервированный бюджет")
-                sr = -amount
-            elif op in {"TRANSFER","CARRY_FORWARD"}:
+            target = None
+            if op in {"TRANSFER", "CARRY_FORWARD"}:
                 if not target_id or target_id == budget_id:
                     raise ValueError("Укажите другой целевой бюджет")
                 target = budget_metrics(conn, target_id)
-                if not target:
-                    raise ValueError("Целевой бюджет не найден")
-                if source["row"]["currency"] != target["row"]["currency"]:
-                    raise ValueError("Перенос между разными валютами не поддерживается")
-                if source["released"] - amount < source["actuals"] + source["commitments"]:
-                    raise ValueError("Недостаточно свободного бюджета для переноса")
-                if op == "CARRY_FORWARD" and target["row"]["fiscal_year"] <= source["row"]["fiscal_year"]:
-                    raise ValueError("Carry forward должен идти в более поздний финансовый год")
-                sa = sr = -amount; ta = tr = amount
+            sa, sr, ta, tr = compute_operation_deltas(op, amount, source, target)
             now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             conn.execute(
                 """INSERT INTO budget_operations(operation_type,source_budget_id,target_budget_id,amount_cents,approved_delta_source,released_delta_source,approved_delta_target,released_delta_target,note,created_by,created_at)
@@ -582,12 +659,15 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect(f"/budgets/{budget_id}", "Операция проведена")
 
     def create_po(self, data):
-        budget_id = int(data["budget_id"])
+        number = require(data, "number", "Номер PO")
+        vendor = require(data, "vendor", "Поставщик")
+        description = require(data, "description", "Содержание")
+        budget_id = parse_int(data.get("budget_id"), "бюджет")
         amount = money_to_cents(data.get("amount"))
         status = data.get("status", "DRAFT").upper()
         if status not in {"DRAFT","APPROVED"}:
             raise ValueError("Некорректный статус PO")
-        with db() as conn:
+        with db(write=True) as conn:
             m = budget_metrics(conn, budget_id)
             if not m:
                 raise ValueError("Бюджет не найден")
@@ -596,7 +676,7 @@ class AppHandler(BaseHTTPRequestHandler):
             now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             conn.execute(
                 "INSERT INTO purchase_orders(number,budget_id,vendor,description,amount_cents,status,created_at) VALUES(?,?,?,?,?,?,?)",
-                (data["number"].strip(),budget_id,data["vendor"].strip(),data["description"].strip(),amount,status,now),
+                (number,budget_id,vendor,description,amount,status,now),
             )
         self.redirect("/pos", "PO создан")
 
@@ -604,7 +684,7 @@ class AppHandler(BaseHTTPRequestHandler):
         new_status = data.get("status", "").upper()
         if new_status not in {"APPROVED","CLOSED","CANCELLED"}:
             raise ValueError("Некорректный статус")
-        with db() as conn:
+        with db(write=True) as conn:
             po = conn.execute("SELECT * FROM purchase_orders WHERE id=?", (po_id,)).fetchone()
             if not po:
                 raise ValueError("PO не найден")
@@ -622,10 +702,12 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect("/pos", "Статус PO изменён")
 
     def create_expense(self, data):
-        budget_id = int(data["budget_id"])
-        po_id = int(data["po_id"]) if data.get("po_id") else None
+        budget_id = parse_int(data.get("budget_id"), "бюджет")
+        po_id = parse_int(data.get("po_id"), "PO") if data.get("po_id") else None
+        expense_date = parse_date(data.get("expense_date"))
+        description = require(data, "description", "Описание")
         amount = money_to_cents(data.get("amount"))
-        with db() as conn:
+        with db(write=True) as conn:
             m = budget_metrics(conn, budget_id)
             if not m:
                 raise ValueError("Бюджет не найден")
@@ -644,7 +726,7 @@ class AppHandler(BaseHTTPRequestHandler):
             now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             conn.execute(
                 "INSERT INTO expenses(budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at) VALUES(?,?,?,?,?,?,?)",
-                (budget_id,po_id,data["expense_date"],data.get("invoice_no","").strip(),data["description"].strip(),amount,now),
+                (budget_id,po_id,expense_date,data.get("invoice_no","").strip(),description,amount,now),
             )
         self.redirect("/expenses", "Расход проведён")
 

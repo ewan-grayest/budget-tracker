@@ -90,3 +90,16 @@ docker cp budget-manager:/data/backup.db ./backup.db
 mkdir -p data
 DB_PATH=./data/budget.db PORT=8080 SEED_DEMO=1 python3 app.py
 ```
+
+## Тесты
+
+Тесты используют только стандартную библиотеку:
+
+```bash
+python3 -m unittest -v
+```
+
+Покрыты разбор сумм, метрики бюджета (`Available`, `Commitments`), правила
+операций и защита от гонки: параллельные записи, изменяющие бюджет,
+выполняются в транзакции `BEGIN IMMEDIATE`, поэтому проверка доступного
+остатка и запись атомарны и бюджет нельзя перерасходовать.
