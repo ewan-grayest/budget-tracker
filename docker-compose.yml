@@ -1,0 +1,18 @@
+services:
+  budget-manager:
+    build: .
+    container_name: budget-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DB_PATH: /data/budget.db
+      SEED_DEMO: "1"
+      # Раскомментируйте для Basic Auth:
+      # APP_USER: admin
+      # APP_PASSWORD: change-me
+    volumes:
+      - budget_data:/data
+
+volumes:
+  budget_data:
