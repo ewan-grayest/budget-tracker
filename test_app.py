@@ -62,13 +62,21 @@ class DBTestBase(unittest.TestCase):
             )
             return cur.lastrowid
 
-    def _add_expense(self, budget_id, amount, po_id=None):
+    def _add_expense(self, budget_id, amount, po_id=None, expense_date="2026-01-01"):
         with app.db(write=True) as conn:
             conn.execute(
                 """INSERT INTO expenses
                 (budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at)
                 VALUES (?,?,?,?,?,?,?)""",
-                (budget_id, po_id, "2026-01-01", "", "desc", amount, "2026-01-01T00:00:00Z"),
+                (budget_id, po_id, expense_date, "", "desc", amount, "2026-01-01T00:00:00Z"),
+            )
+
+    def _set_allocations(self, budget_id, alloc):
+        """Insert allocation rows from a {month: cents} mapping."""
+        with app.db(write=True) as conn:
+            conn.executemany(
+                "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
+                [(budget_id, m, v) for m, v in alloc.items()],
             )
 
 
@@ -184,6 +192,133 @@ class BudgetMetricsTests(DBTestBase):
     def test_missing_budget_returns_none(self):
         with app.db() as conn:
             self.assertIsNone(app.budget_metrics(conn, 999_999))
+
+
+class SpreadEvenlyTests(unittest.TestCase):
+    def test_sum_and_shape(self):
+        for total in (0, 1, 11, 12, 100, 10_000_000, 10_000_007):
+            values = app.spread_evenly(total)
+            self.assertEqual(len(values), 12)
+            self.assertEqual(sum(values), total)
+            self.assertLessEqual(max(values) - min(values), 1)
+
+    def test_remainder_goes_to_earliest_months(self):
+        self.assertEqual(app.spread_evenly(14), [2, 2] + [1] * 10)
+
+
+class MoneyToCentsOrZeroTests(unittest.TestCase):
+    def test_blank_and_zero_mean_zero(self):
+        for value in ("", "   ", None, "0", "0.00", "0,00", "000"):
+            self.assertEqual(app.money_to_cents_or_zero(value), 0)
+
+    def test_amounts_parse_like_money_to_cents(self):
+        self.assertEqual(app.money_to_cents_or_zero("10.50"), 1_050)
+        self.assertEqual(app.money_to_cents_or_zero("1 000,50"), 100_050)
+
+    def test_rejects_negative_and_garbage(self):
+        for bad in ("-5", "abc", "1.2.3"):
+            with self.assertRaises(ValueError):
+                app.money_to_cents_or_zero(bad)
+
+
+class MonthlyMetricsTests(DBTestBase):
+    def test_missing_budget_returns_none(self):
+        with app.db() as conn:
+            self.assertIsNone(app.monthly_metrics(conn, 999_999))
+
+    def test_no_plan_keeps_legacy_behavior(self):
+        bid = self._add_budget()
+        self._add_expense(bid, 300, expense_date="2026-01-15")
+        with app.db() as conn:
+            mm = app.monthly_metrics(conn, bid)
+        self.assertFalse(mm["has_plan"])
+        self.assertEqual(mm["allocated_total"], 0)
+        self.assertTrue(all(m["allocated"] == 0 for m in mm["months"]))
+        # Actuals are still bucketed, but nothing is flagged as over plan.
+        self.assertEqual(mm["months"][0]["actuals"], 300)
+        self.assertFalse(any(m["over"] for m in mm["months"]))
+
+    def test_actuals_grouped_by_month(self):
+        bid = self._add_budget()
+        self._add_expense(bid, 300, expense_date="2026-01-15")
+        self._add_expense(bid, 200, expense_date="2026-02-02")
+        self._add_expense(bid, 200, expense_date="2026-02-20")
+        with app.db() as conn:
+            mm = app.monthly_metrics(conn, bid)
+        self.assertEqual(mm["months"][0]["actuals"], 300)
+        self.assertEqual(mm["months"][1]["actuals"], 400)
+        self.assertEqual(sum(m["actuals"] for m in mm["months"]), 700)
+        self.assertEqual(mm["actuals_in_year"], 700)
+
+    def test_out_of_fiscal_year_expenses_excluded_from_buckets(self):
+        bid = self._add_budget(fiscal_year=2026)
+        self._add_expense(bid, 500, expense_date="2025-12-31")
+        with app.db() as conn:
+            mm = app.monthly_metrics(conn, bid)
+            annual = app.budget_metrics(conn, bid)
+        self.assertEqual(sum(m["actuals"] for m in mm["months"]), 0)
+        self.assertEqual(mm["actuals_out_of_year"], 500)
+        # The annual hard control still counts every expense of the line.
+        self.assertEqual(annual["actuals"], 500)
+
+    def test_remaining_and_over_flag(self):
+        bid = self._add_budget()
+        self._set_allocations(bid, {1: 100, 2: 100})
+        self._add_expense(bid, 150, expense_date="2026-01-10")
+        self._add_expense(bid, 30, expense_date="2026-03-10")  # month without allocation
+        with app.db() as conn:
+            mm = app.monthly_metrics(conn, bid)
+        self.assertTrue(mm["has_plan"])
+        jan, feb, mar = mm["months"][0], mm["months"][1], mm["months"][2]
+        self.assertEqual((jan["remaining"], jan["over"]), (-50, True))
+        self.assertEqual((feb["remaining"], feb["over"]), (100, False))
+        # With a plan in place, spending in an unallocated month is over plan.
+        self.assertEqual((mar["allocated"], mar["over"]), (0, True))
+        self.assertEqual(mm["allocated_total"], 200)
+
+
+class MonthOverspentTests(DBTestBase):
+    def test_false_without_plan_or_outside_year(self):
+        bid = self._add_budget(fiscal_year=2026)
+        self._add_expense(bid, 999, expense_date="2026-01-01")
+        with app.db() as conn:
+            self.assertFalse(app.month_overspent(conn, bid, "2026-01-01"))  # no plan
+        self._set_allocations(bid, {1: 100})
+        with app.db() as conn:
+            self.assertTrue(app.month_overspent(conn, bid, "2026-01-01"))
+            self.assertFalse(app.month_overspent(conn, bid, "2025-01-01"))  # other year
+            self.assertFalse(app.month_overspent(conn, 999_999, "2026-01-01"))  # missing budget
+
+
+class AllocationsSchemaTests(DBTestBase):
+    def test_init_db_upgrades_existing_database(self):
+        # Simulate a DB created before the monthly feature: drop the new table,
+        # then re-run init_db() as an app restart would.
+        bid = self._add_budget()
+        with app.db(write=True) as conn:
+            conn.execute("DROP TABLE budget_monthly_allocations")
+        app.init_db()
+        self._set_allocations(bid, {1: 100})
+        with app.db() as conn:
+            row = conn.execute("SELECT id FROM budget_lines WHERE id=?", (bid,)).fetchone()
+            mm = app.monthly_metrics(conn, bid)
+        self.assertIsNotNone(row)  # existing data survived
+        self.assertEqual(mm["months"][0]["allocated"], 100)
+
+    def test_budget_with_only_allocations_is_deletable(self):
+        bid = self._add_budget()
+        self._set_allocations(bid, {1: 100, 5: 200})
+        # Mirror delete_budget: allocations are not linked documents, they are
+        # removed together with the line.
+        with app.db(write=True) as conn:
+            conn.execute("DELETE FROM budget_monthly_allocations WHERE budget_id=?", (bid,))
+            conn.execute("DELETE FROM budget_lines WHERE id=?", (bid,))
+        with app.db() as conn:
+            self.assertIsNone(app.monthly_metrics(conn, bid))
+            left = conn.execute(
+                "SELECT COUNT(*) FROM budget_monthly_allocations WHERE budget_id=?", (bid,)
+            ).fetchone()[0]
+        self.assertEqual(left, 0)
 
 
 class CentsToInputTests(unittest.TestCase):

@@ -6,6 +6,8 @@
 
 - бюджеты по финансовому году, Budget Holder, Cost Center, WBS и Cost Element;
 - approved и released budget;
+- помесячный план бюджета: распределение по 12 месяцам финансового года,
+  факт и остаток по каждому месяцу, мягкий контроль превышения;
 - операции Supplement, Reduction, Release, Return, Transfer и Carry Forward;
 - PO в статусах Draft, Approved, Closed и Cancelled;
 - резервирование бюджета через открытые Approved PO;
@@ -47,6 +49,31 @@ Commitment PO = PO amount - expenses linked to this PO
 - Closed/Cancelled PO не создаёт commitment; остаток освобождается.
 - Расход без PO непосредственно уменьшает available budget.
 
+## Помесячный план
+
+На карточке бюджета (`/budgets/{id}`) можно распределить бюджет по 12 месяцам
+финансового года (форма сохраняется в `POST /budgets/{id}/allocations`; кнопка
+«Распределить равномерно» делит released-бюджет на 12 частей). Расходы
+относятся к месяцу по своей дате; по каждому месяцу показываются план, факт,
+остаток и статус.
+
+Контроль помесячного плана — **мягкий**: расход сверх плана месяца проводится,
+но месяц подсвечивается статусом «Превышение», а после проведения показывается
+предупреждение. Жёстким остаётся только годовой контроль (`Available ≥ 0`).
+Если план не задан, бюджет ведёт себя как раньше — только годовой контроль.
+Список расходов (`/expenses`) поддерживает фильтр по месяцу (`?month=YYYY-MM`).
+
+<!-- English: monthly plan. A budget line's released budget can be allocated
+     across the 12 months of its fiscal year on the budget detail page
+     (POST /budgets/{id}/allocations; a "distribute evenly" button splits the
+     released amount). Expenses are bucketed by expense date; each month shows
+     plan, actuals, remaining and status. Monthly control is soft: an over-plan
+     expense is still posted but the month is flagged and a warning flash is
+     shown. Only the annual `Available >= 0` check blocks postings. Lines
+     without a plan behave as before. The expenses list accepts a
+     ?month=YYYY-MM filter. -->
+
+
 ## Операции бюджета
 
 - `SUPPLEMENT`: увеличивает approved и released.
@@ -66,6 +93,9 @@ Commitment PO = PO amount - expenses linked to this PO
 | PO        | `/pos/new`    | `/pos/{id}`       | `/pos/{id}/edit` (+ `/pos/{id}/status`) | `/pos/{id}/delete` | `/pos`        |
 | Расходы   | `/expenses/new` | `/expenses/{id}` | `/expenses/{id}/edit` | `/expenses/{id}/delete` | `/expenses`   |
 | Операции  | `/budgets/{id}/operation` | `/operations/{id}` | `/operations/{id}/edit` | `/operations/{id}/delete` | `/operations` |
+
+Помесячный план бюджета сохраняется через `POST /budgets/{id}/allocations`
+(12 сумм; пустые поля означают 0, полностью пустая форма удаляет план).
 
 Правила целостности при изменении и удалении:
 
@@ -190,3 +220,8 @@ python3 -m unittest -v
 Также покрыты парсинг курсов ЦБ РФ (`parse_cbr_rates`), конвертация валют
 (`convert_cents`), обновление курсов (`refresh_rates` с подменой сетевого
 запроса) и настройки (`get_setting`/`set_setting`) — всё без обращения к сети.
+
+Помесячный план покрыт тестами `monthly_metrics` (группировка факта по месяцам,
+флаг превышения, расходы вне финансового года), `spread_evenly`,
+`money_to_cents_or_zero`, а также проверкой автоматического обновления схемы
+существующей БД при рестарте (`init_db`).

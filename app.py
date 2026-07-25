@@ -571,6 +571,79 @@ _CURRENCY_TRANSLATIONS = {
 for _lang, _msgs in _CURRENCY_TRANSLATIONS.items():
     TRANSLATIONS.setdefault(_lang, {}).update(_msgs)
 
+# Monthly budgeting strings. Same pattern as _CURRENCY_TRANSLATIONS: the
+# feature contributes its own keys without editing the large catalog above.
+_MONTHLY_TRANSLATIONS = {
+    "ru": {
+        "h2.monthly": "Помесячный план",                     # budget detail — monthly breakdown block
+        "col.month": "Месяц",                                # month column
+        "col.allocated": "План",                             # allocated amount column
+        "col.remaining": "Остаток",                          # remaining amount column
+        "month.1": "Январь",                                 # January
+        "month.2": "Февраль",                                # February
+        "month.3": "Март",                                   # March
+        "month.4": "Апрель",                                 # April
+        "month.5": "Май",                                    # May
+        "month.6": "Июнь",                                   # June
+        "month.7": "Июль",                                   # July
+        "month.8": "Август",                                 # August
+        "month.9": "Сентябрь",                               # September
+        "month.10": "Октябрь",                               # October
+        "month.11": "Ноябрь",                                # November
+        "month.12": "Декабрь",                               # December
+        "misc.total": "Итого",                               # totals row label
+        "misc.no_monthly_plan": "План по месяцам не задан — контроль только по годовому бюджету.",  # no monthly plan note
+        "misc.alloc_note": "Пустое поле = 0. Очистите все поля, чтобы удалить помесячный план. Превышение плана месяца не блокирует расходы — жёстко контролируется только годовой бюджет.",  # allocation form hint
+        "misc.alloc_vs_released": "Сумма плана ({allocated}) не совпадает с released-бюджетом ({released}).",  # plan total mismatch warning
+        "misc.out_of_year_actuals": "Расходы вне финансового года {year}: {money}.",  # out-of-fiscal-year actuals note
+        "status.month_ok": "OK",                             # month within plan
+        "status.month_over": "Превышение",                   # month over plan
+        "btn.save_allocations": "Сохранить план",            # save monthly plan
+        "btn.distribute_evenly": "Распределить равномерно",  # spread released budget over 12 months
+        "btn.apply_filter": "Фильтр",                        # apply month filter
+        "btn.clear_filter": "Сброс",                         # clear month filter
+        "flash.allocations_saved": "Помесячный план сохранён",  # allocations saved
+        "flash.allocations_cleared": "Помесячный план удалён",  # allocations cleared
+        "flash.expense_posted_over_month": "Расход проведён — превышен план месяца",   # posted, month over plan
+        "flash.expense_updated_over_month": "Расход обновлён — превышен план месяца",  # updated, month over plan
+    },
+    "en": {
+        "h2.monthly": "Monthly plan",
+        "col.month": "Month",
+        "col.allocated": "Planned",
+        "col.remaining": "Remaining",
+        "month.1": "January",
+        "month.2": "February",
+        "month.3": "March",
+        "month.4": "April",
+        "month.5": "May",
+        "month.6": "June",
+        "month.7": "July",
+        "month.8": "August",
+        "month.9": "September",
+        "month.10": "October",
+        "month.11": "November",
+        "month.12": "December",
+        "misc.total": "Total",
+        "misc.no_monthly_plan": "No monthly plan is set — only the annual budget is controlled.",
+        "misc.alloc_note": "Blank field = 0. Clear all fields to remove the monthly plan. Exceeding a month's plan does not block expenses — only the annual budget is enforced.",
+        "misc.alloc_vs_released": "Planned total ({allocated}) differs from the released budget ({released}).",
+        "misc.out_of_year_actuals": "Actuals outside fiscal year {year}: {money}.",
+        "status.month_ok": "OK",
+        "status.month_over": "Over plan",
+        "btn.save_allocations": "Save plan",
+        "btn.distribute_evenly": "Distribute evenly",
+        "btn.apply_filter": "Filter",
+        "btn.clear_filter": "Reset",
+        "flash.allocations_saved": "Monthly plan saved",
+        "flash.allocations_cleared": "Monthly plan removed",
+        "flash.expense_posted_over_month": "Expense posted — month plan exceeded",
+        "flash.expense_updated_over_month": "Expense updated — month plan exceeded",
+    },
+}
+for _lang, _msgs in _MONTHLY_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_lang, {}).update(_msgs)
+
 
 def normalize_lang(value):
     """Return `value` if it is a supported language code, else None."""
@@ -686,6 +759,14 @@ def init_db():
                 FOREIGN KEY(po_id) REFERENCES purchase_orders(id)
             );
 
+            CREATE TABLE IF NOT EXISTS budget_monthly_allocations (
+                budget_id INTEGER NOT NULL,
+                month INTEGER NOT NULL CHECK(month BETWEEN 1 AND 12),
+                allocated_cents INTEGER NOT NULL DEFAULT 0 CHECK(allocated_cents >= 0),
+                PRIMARY KEY(budget_id, month),
+                FOREIGN KEY(budget_id) REFERENCES budget_lines(id)
+            );
+
             CREATE TABLE IF NOT EXISTS currencies (
                 code TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -744,6 +825,20 @@ def init_db():
             VALUES (?,?,?,?,?,?,?)""",
             (budget_id, po_id, date.today().isoformat(), "INV-DEMO-001", "Monthly support services", 700000, now),
         )
+        # Monthly plan: spread released evenly, then shrink the current month
+        # below the demo expense (moving the surplus to another month) so the
+        # seeded app immediately shows one over-plan month. Total still equals
+        # the released budget.
+        values = spread_evenly(10000000)
+        cur = date.today().month
+        dst = 0 if cur == 12 else 11
+        if values[cur - 1] > 500000:
+            values[dst] += values[cur - 1] - 500000
+            values[cur - 1] = 500000
+        conn.executemany(
+            "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
+            [(budget_id, i + 1, v) for i, v in enumerate(values)],
+        )
 
 
 def money_to_cents(value, lang=DEFAULT_LANG):
@@ -764,6 +859,15 @@ def money_to_cents(value, lang=DEFAULT_LANG):
     if amount <= 0:
         raise ValueError(t(lang, "error.amount_positive"))
     return int(amount * 100)
+
+
+def money_to_cents_or_zero(value, lang=DEFAULT_LANG):
+    """money_to_cents() for allocation fields, where blank or an explicit
+    zero means "no budget this month" rather than an input error."""
+    text = (value or "").strip()
+    if not text or re.fullmatch(r"0+([.,]0+)?", text.replace(" ", "")):
+        return 0
+    return money_to_cents(value, lang)
 
 
 def parse_int(value, label, lang=DEFAULT_LANG):
@@ -865,6 +969,70 @@ def assert_budget_ok(conn, budget_id, lang=DEFAULT_LANG):
         raise ValueError(t(lang, "error.released_exceeds_approved", code=code))
     if m["available"] < 0:
         raise ValueError(t(lang, "error.available_negative", code=code))
+
+
+def spread_evenly(total_cents):
+    """Split `total_cents` into 12 monthly amounts differing by at most one
+    cent, with the remainder going to the earliest months. Sum is exact."""
+    base, extra = divmod(int(total_cents), 12)
+    return [base + 1 if i < extra else base for i in range(12)]
+
+
+def monthly_metrics(conn, budget_id):
+    """Per-month plan vs actuals for a budget line's fiscal year.
+
+    Expenses are bucketed by expense_date (always YYYY-MM-DD, enforced by
+    parse_date). Months are keyed to the line's fiscal_year, so changing the
+    year on the line re-buckets actuals automatically. A line with no
+    allocation rows has no monthly plan: has_plan is False and no month is
+    flagged `over` (legacy annual-only behavior). Monthly control is soft —
+    nothing here blocks postings; the hard limit stays in budget_metrics.
+    """
+    row = conn.execute("SELECT * FROM budget_lines WHERE id=?", (budget_id,)).fetchone()
+    if not row:
+        return None
+    year = str(row["fiscal_year"])
+    alloc = dict(conn.execute(
+        "SELECT month, allocated_cents FROM budget_monthly_allocations WHERE budget_id=?",
+        (budget_id,)).fetchall())
+    actual = dict(conn.execute(
+        """SELECT CAST(substr(expense_date,6,2) AS INTEGER) m, COALESCE(SUM(amount_cents),0)
+           FROM expenses WHERE budget_id=? AND substr(expense_date,1,4)=? GROUP BY m""",
+        (budget_id, year)).fetchall())
+    out_of_year = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM expenses WHERE budget_id=? AND substr(expense_date,1,4)<>?",
+        (budget_id, year)).fetchone()[0]
+    has_plan = bool(alloc)
+    months = []
+    for m in range(1, 13):
+        allocated = alloc.get(m, 0)
+        actuals = actual.get(m, 0)
+        months.append({
+            "month": m,
+            "allocated": allocated,
+            "actuals": actuals,
+            "remaining": allocated - actuals,
+            "over": has_plan and actuals > allocated,
+        })
+    return {
+        "row": row,
+        "has_plan": has_plan,
+        "months": months,
+        "allocated_total": sum(alloc.values()),
+        "actuals_in_year": sum(actual.values()),
+        "actuals_out_of_year": out_of_year,
+    }
+
+
+def month_overspent(conn, budget_id, expense_date):
+    """True when the month containing `expense_date` is over its allocation
+    (used for the soft-control warning flash after posting an expense)."""
+    mm = monthly_metrics(conn, budget_id)
+    if not mm or not mm["has_plan"]:
+        return False
+    if expense_date[:4] != str(mm["row"]["fiscal_year"]):
+        return False
+    return mm["months"][int(expense_date[5:7]) - 1]["over"]
 
 
 def compute_operation_deltas(op, amount, source, target, lang=DEFAULT_LANG):
@@ -1049,7 +1217,8 @@ form.inline{display:inline}.form-grid{display:grid;grid-template-columns:repeat(
 label{display:block;font-size:13px;color:#475569;margin-bottom:5px}input,select,textarea{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;font:inherit}textarea{min-height:76px;resize:vertical}
 button,.button{display:inline-block;border:0;border-radius:7px;padding:10px 14px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}.button.secondary,button.secondary{background:#475569}.button.danger,button.danger{background:var(--bad)}
 .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700;background:#e2e8f0}.badge.APPROVED{background:#dcfce7;color:#166534}.badge.DRAFT{background:#fef3c7;color:#92400e}.badge.CLOSED{background:#e0e7ff;color:#3730a3}.badge.CANCELLED{background:#fee2e2;color:#991b1b}
-.flash{padding:12px 14px;border-radius:8px;margin-bottom:16px;background:#dbeafe;color:#1e3a8a}.flash.error{background:#fee2e2;color:#991b1b}.muted{color:var(--muted)}.small{font-size:12px}.split{display:grid;grid-template-columns:2fr 1fr;gap:16px}@media(max-width:850px){.split{grid-template-columns:1fr}.nav{gap:10px}.top{align-items:flex-start;padding:14px 0;flex-direction:column}}
+.badge.OK{background:#dcfce7;color:#166534}.badge.OVER{background:#fee2e2;color:#991b1b}tr.over td{background:#fef2f2}
+.flash{padding:12px 14px;border-radius:8px;margin-bottom:16px;background:#dbeafe;color:#1e3a8a}.flash.error{background:#fee2e2;color:#991b1b}.flash.warn{background:#fef3c7;color:#92400e}.muted{color:var(--muted)}.small{font-size:12px}.split{display:grid;grid-template-columns:2fr 1fr;gap:16px}@media(max-width:850px){.split{grid-template-columns:1fr}.nav{gap:10px}.top{align-items:flex-start;padding:14px 0;flex-direction:column}}
 .progress{height:9px;background:#e2e8f0;border-radius:999px;overflow:hidden}.progress>span{display:block;height:100%;background:var(--accent)}.footer{color:var(--muted);font-size:12px;margin:26px 0}
 .langsw{color:#93c5fd;margin-left:10px;font-size:13px}.langsw.active{color:#fff;font-weight:700}
 .ccysw{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.ccysw .langsw{color:var(--accent);margin-left:0}.ccysw .langsw.active{color:var(--text);font-weight:700}
@@ -1107,10 +1276,10 @@ class AppHandler(BaseHTTPRequestHandler):
             raise ValueError(self.t("error.csrf"))
         return data
 
-    def redirect(self, path, message=None, error=False):
+    def redirect(self, path, message=None, error=False, kind=None):
         if message:
             sep = "&" if "?" in path else "?"
-            path += sep + urlencode({"msg": message, "kind": "error" if error else "ok"})
+            path += sep + urlencode({"msg": message, "kind": kind or ("error" if error else "ok")})
         self.send_response(303)
         self.send_header("Location", path)
         self.end_headers()
@@ -1149,7 +1318,8 @@ class AppHandler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
         flash = ""
         if q.get("msg"):
-            cls = "flash error" if q.get("kind", [""])[0] == "error" else "flash"
+            kind = q.get("kind", [""])[0]
+            cls = {"error": "flash error", "warn": "flash warn"}.get(kind, "flash")
             flash = f'<div class="{cls}">{esc(q["msg"][0])}</div>'
         nav = (f'<a href="/">{esc(self.t("nav.overview"))}</a>'
                f'<a href="/budgets">{esc(self.t("nav.budgets"))}</a>'
@@ -1360,6 +1530,9 @@ class AppHandler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/budgets/(\d+)/operation", path)
             if m:
                 return self.create_operation(int(m.group(1)), data)
+            m = re.fullmatch(r"/budgets/(\d+)/allocations", path)
+            if m:
+                return self.save_allocations(int(m.group(1)), data)
             m = re.fullmatch(r"/budgets/(\d+)/edit", path)
             if m:
                 return self.update_budget(int(m.group(1)), data)
@@ -1470,6 +1643,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if not m:
                 return self.send_html(self.page(self.t("title.not_found"), f"<h1>{esc(self.t('misc.budget_not_found'))}</h1>"), 404)
             r = m["row"]
+            mm = monthly_metrics(conn, budget_id)
             budgets = conn.execute("SELECT id,code,name,currency FROM budget_lines WHERE id<>? ORDER BY code", (budget_id,)).fetchall()
             pos = conn.execute(
                 """SELECT po.*, COALESCE(SUM(e.amount_cents),0) spent FROM purchase_orders po
@@ -1494,6 +1668,41 @@ class AppHandler(BaseHTTPRequestHandler):
         op_rows = "".join(
             f"<tr><td>{esc(o['created_at'][:10])}</td><td>{esc(o['operation_type'])}</td><td>{esc(o['source_code'])}</td><td>{esc(o['target_code'])}</td><td>{self.money_disp(o['amount_cents'],r['currency'])}</td><td>{esc(o['note'])}</td></tr>" for o in ops
         ) or f"<tr><td colspan='6' class='muted'>{esc(self.t('empty.operations'))}</td></tr>"
+        month_rows = ""
+        for mo in mm["months"]:
+            if mm["has_plan"]:
+                badge = "OVER" if mo["over"] else "OK"
+                status = f"<span class='badge {badge}'>{esc(self.t('status.month_over' if mo['over'] else 'status.month_ok'))}</span>"
+                rem_cls = "bad" if mo["remaining"] < 0 else "good"
+            else:
+                status, rem_cls = "—", "muted"
+            row_cls = " class='over'" if mo["over"] else ""
+            month_name = esc(self.t("month.%d" % mo["month"]))
+            month_rows += (f"<tr{row_cls}><td>{month_name}</td>"
+                           f"<td>{self.money_disp(mo['allocated'], r['currency'])}</td>"
+                           f"<td>{self.money_disp(mo['actuals'], r['currency'])}</td>"
+                           f"<td class='{rem_cls}'>{self.money_disp(mo['remaining'], r['currency'])}</td>"
+                           f"<td>{status}</td></tr>")
+        month_rows += (f"<tr><td><strong>{esc(self.t('misc.total'))}</strong></td>"
+                       f"<td><strong>{self.money_disp(mm['allocated_total'], r['currency'])}</strong></td>"
+                       f"<td><strong>{self.money_disp(mm['actuals_in_year'], r['currency'])}</strong></td>"
+                       f"<td><strong>{self.money_disp(mm['allocated_total'] - mm['actuals_in_year'], r['currency'])}</strong></td><td></td></tr>")
+        monthly_notes = ""
+        if not mm["has_plan"]:
+            monthly_notes += f"<p class='muted small'>{esc(self.t('misc.no_monthly_plan'))}</p>"
+        elif mm["allocated_total"] != m["released"]:
+            monthly_notes += (f"<p class='warn small'>{esc(self.t('misc.alloc_vs_released', allocated=self.money(mm['allocated_total'], r['currency']), released=self.money(m['released'], r['currency'])))}</p>")
+        if mm["actuals_out_of_year"]:
+            monthly_notes += (f"<p class='muted small'>{esc(self.t('misc.out_of_year_actuals', year=r['fiscal_year'], money=self.money(mm['actuals_out_of_year'], r['currency'])))}</p>")
+        alloc_inputs = "".join(
+            f"<div><label>{esc(self.t('month.%d' % mo['month']))}</label>"
+            f"<input name='alloc_{mo['month']}' value='{cents_to_input(mo['allocated']) if mm['has_plan'] else ''}'></div>"
+            for mo in mm["months"])
+        monthly_panel = f"""<div class="panel"><h2>{esc(self.t('h2.monthly'))}</h2>{monthly_notes}
+        <div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.month'))}</th><th>{esc(self.t('col.allocated'))}</th><th>{esc(self.t('col.actuals'))}</th><th>{esc(self.t('col.remaining'))}</th><th>{esc(self.t('col.status'))}</th></tr></thead><tbody>{month_rows}</tbody></table></div>
+        <br><form method="post" action="/budgets/{budget_id}/allocations">{self.csrf_input()}<div class="form-grid">{alloc_inputs}
+        <div class="full"><button type="submit">{esc(self.t('btn.save_allocations'))}</button> <button type="submit" name="action" value="distribute" class="secondary">{esc(self.t('btn.distribute_evenly'))}</button></div></div></form>
+        <p class="muted small">{esc(self.t('misc.alloc_note'))}</p></div><br>"""
         body = f"""<div class="toolbar"><h1>{esc(r['code'])}: {esc(r['name'])}</h1>{self.currency_switcher()}<a class="button secondary" href="/budgets/{budget_id}/edit">{esc(self.t('btn.edit'))}</a></div>
         <p class="muted">{self.t('misc.budget_meta', holder=esc(r['holder_name']), cost_center=esc(r['cost_center']), wbs=esc(r['wbs']), ce=esc(r['cost_element']))}</p>
         <div class="grid cards"><div class="card"><div class="label">{esc(self.t('metric.approved'))}</div><div class="metric">{self.money_disp(m['approved'],r['currency'])}</div></div>
@@ -1501,6 +1710,7 @@ class AppHandler(BaseHTTPRequestHandler):
         <div class="card"><div class="label">{esc(self.t('metric.actuals'))}</div><div class="metric">{self.money_disp(m['actuals'],r['currency'])}</div></div>
         <div class="card"><div class="label">{esc(self.t('metric.commitments'))}</div><div class="metric">{self.money_disp(m['commitments'],r['currency'])}</div></div>
         <div class="card"><div class="label">{esc(self.t('metric.available'))}</div><div class="metric {'bad' if m['available']<0 else 'good'}">{self.money_disp(m['available'],r['currency'])}</div></div></div><br>
+        {monthly_panel}
         <div class="split"><div><div class="panel"><h2>{esc(self.t('h2.pos'))}</h2><div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.number'))}</th><th>{esc(self.t('col.vendor'))}</th><th>{esc(self.t('col.description'))}</th><th>{esc(self.t('col.status'))}</th><th>{esc(self.t('col.amount'))}</th><th>{esc(self.t('col.actuals'))}</th></tr></thead><tbody>{po_rows}</tbody></table></div></div><br>
         <div class="panel"><h2>{esc(self.t('h2.expenses'))}</h2><div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.date'))}</th><th>{esc(self.t('col.invoice'))}</th><th>{esc(self.t('col.description'))}</th><th>{esc(self.t('col.po'))}</th><th>{esc(self.t('col.amount'))}</th></tr></thead><tbody>{exp_rows}</tbody></table></div></div></div>
         <aside><div class="panel"><h2>{esc(self.t('h2.budget_operation'))}</h2><form method="post" action="/budgets/{budget_id}/operation">{self.csrf_input()}
@@ -1541,10 +1751,15 @@ class AppHandler(BaseHTTPRequestHandler):
         return f'<form class="inline" method="post" action="/pos/{po_id}/status">{self.csrf_input()}<input type="hidden" name="status" value="{status}"><button class="{cls}" type="submit">{esc(label)}</button></form>'
 
     def expenses_page(self):
+        month = parse_qs(urlparse(self.path).query).get("month", [""])[0]
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            month = ""
+        month_where = "WHERE substr(e.expense_date,1,7)=?" if month else ""
         with db() as conn:
             expenses = conn.execute(
-                """SELECT e.*,b.code,b.currency,po.number po_number FROM expenses e JOIN budget_lines b ON b.id=e.budget_id
-                   LEFT JOIN purchase_orders po ON po.id=e.po_id ORDER BY e.expense_date DESC,e.id DESC"""
+                f"""SELECT e.*,b.code,b.currency,po.number po_number FROM expenses e JOIN budget_lines b ON b.id=e.budget_id
+                   LEFT JOIN purchase_orders po ON po.id=e.po_id {month_where} ORDER BY e.expense_date DESC,e.id DESC""",
+                (month,) if month else (),
             ).fetchall()
             budgets = all_budget_metrics(conn)
             pos = conn.execute(
@@ -1555,7 +1770,14 @@ class AppHandler(BaseHTTPRequestHandler):
         rows = "".join(f"<tr><td>{esc(e['expense_date'])}</td><td>{esc(e['code'])}</td><td>{esc(e['po_number'] or self.t('misc.no_po'))}</td><td>{esc(e['invoice_no'])}</td><td>{esc(e['description'])}</td><td>{self.money_disp(e['amount_cents'],e['currency'])}</td><td><a class='button secondary' href='/expenses/{e['id']}'>{esc(self.t('btn.open'))}</a></td></tr>" for e in expenses)
         budget_options = "".join(f'<option value="{m["row"]["id"]}">{self.t("opt.available", code=esc(m["row"]["code"]), money=self.money(m["available"],m["row"]["currency"]))}</option>' for m in budgets)
         po_options = "".join(f'<option value="{p["id"]}">{self.t("opt.remaining", number=esc(p["number"]), money=self.money(max(p["amount_cents"]-p["spent"],0),p["currency"]))}</option>' for p in pos)
-        body = f"""<div class="toolbar"><h1>{esc(self.t('h1.expenses'))}</h1>{self.currency_switcher()}</div><div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.date'))}</th><th>{esc(self.t('col.budget'))}</th><th>{esc(self.t('col.po'))}</th><th>{esc(self.t('col.invoice'))}</th><th>{esc(self.t('col.description'))}</th><th>{esc(self.t('col.amount'))}</th><th>{esc(self.t('col.actions'))}</th></tr></thead><tbody>{rows}</tbody></table></div><br>
+        ccy_keep = ""
+        self.ensure_display_context()
+        if self.display_ccy != self.base_ccy:
+            ccy_keep = f'<input type="hidden" name="ccy" value="{esc(self.display_ccy)}">'
+        clear_link = f' <a class="button secondary" href="/expenses">{esc(self.t("btn.clear_filter"))}</a>' if month else ""
+        month_filter = (f'<form class="inline" method="get"><input type="month" name="month" value="{esc(month)}">{ccy_keep}'
+                        f'<button class="secondary" type="submit">{esc(self.t("btn.apply_filter"))}</button></form>{clear_link}')
+        body = f"""<div class="toolbar"><h1>{esc(self.t('h1.expenses'))}</h1><div class="ccysw">{month_filter}</div>{self.currency_switcher()}</div><div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.date'))}</th><th>{esc(self.t('col.budget'))}</th><th>{esc(self.t('col.po'))}</th><th>{esc(self.t('col.invoice'))}</th><th>{esc(self.t('col.description'))}</th><th>{esc(self.t('col.amount'))}</th><th>{esc(self.t('col.actions'))}</th></tr></thead><tbody>{rows}</tbody></table></div><br>
         <div class="panel"><h2>{esc(self.t('h2.add_expense'))}</h2><form method="post" action="/expenses/new">{self.csrf_input()}<div class="form-grid">
         <div><label>{esc(self.t('label.budget'))} *</label><select name="budget_id" required>{budget_options}</select></div><div><label>{esc(self.t('label.po'))}</label><select name="po_id"><option value="">{esc(self.t('misc.no_po'))}</option>{po_options}</select></div>
         <div><label>{esc(self.t('label.date'))} *</label><input type="date" name="expense_date" value="{date.today().isoformat()}" required></div><div><label>{esc(self.t('label.invoice'))}</label><input name="invoice_no"></div>
@@ -1596,6 +1818,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 (code, name, fiscal_year, holder_name, data.get("holder_email","").strip(), data.get("cost_center","").strip(), data.get("wbs","").strip(), data.get("cost_element","").strip(), currency, approved, released, now),
             )
         self.redirect("/budgets", self.t("flash.budget_created"))
+
+    def save_allocations(self, budget_id, data):
+        with db(write=True) as conn:
+            m = budget_metrics(conn, budget_id)
+            if not m:
+                raise ValueError(self.t("error.budget_not_found"))
+            if data.get("action") == "distribute":
+                values = spread_evenly(m["released"])
+            else:
+                values = [money_to_cents_or_zero(data.get(f"alloc_{i}"), self.lang) for i in range(1, 13)]
+            conn.execute("DELETE FROM budget_monthly_allocations WHERE budget_id=?", (budget_id,))
+            if any(values):
+                conn.executemany(
+                    "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
+                    [(budget_id, i + 1, v) for i, v in enumerate(values)],
+                )
+                msg = self.t("flash.allocations_saved")
+            else:
+                msg = self.t("flash.allocations_cleared")
+        self.redirect(f"/budgets/{budget_id}", msg)
 
     def create_operation(self, budget_id, data):
         op = data.get("operation_type", "").upper()
@@ -1692,7 +1934,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 "INSERT INTO expenses(budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at) VALUES(?,?,?,?,?,?,?)",
                 (budget_id,po_id,expense_date,data.get("invoice_no","").strip(),description,amount,now),
             )
-        self.redirect("/expenses", self.t("flash.expense_posted"))
+            over = month_overspent(conn, budget_id, expense_date)
+        if over:
+            self.redirect("/expenses", self.t("flash.expense_posted_over_month"), kind="warn")
+        else:
+            self.redirect("/expenses", self.t("flash.expense_posted"))
 
     # ------------------------------------------------------------------ #
     # Budgets: update / delete                                           #
@@ -1767,6 +2013,10 @@ class AppHandler(BaseHTTPRequestHandler):
             ).fetchone()[0]
             if linked:
                 raise ValueError(self.t("error.cannot_delete_budget_linked"))
+            # The monthly plan is attached data, not a transaction document: it
+            # never blocks deletion and goes away with the line (the FK would
+            # otherwise reject the delete).
+            conn.execute("DELETE FROM budget_monthly_allocations WHERE budget_id=?", (budget_id,))
             conn.execute("DELETE FROM budget_lines WHERE id=?", (budget_id,))
         self.redirect("/budgets", self.t("flash.budget_deleted"))
 
@@ -1917,7 +2167,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError(self.t("error.expense_exceeds_po"))
             assert_budget_ok(conn, e["budget_id"])
             assert_budget_ok(conn, budget_id)
-        self.redirect(f"/expenses/{expense_id}", self.t("flash.expense_updated"))
+            over = month_overspent(conn, budget_id, expense_date)
+        if over:
+            self.redirect(f"/expenses/{expense_id}", self.t("flash.expense_updated_over_month"), kind="warn")
+        else:
+            self.redirect(f"/expenses/{expense_id}", self.t("flash.expense_updated"))
 
     def delete_expense(self, expense_id, data):
         with db(write=True) as conn:
