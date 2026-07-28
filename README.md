@@ -4,7 +4,13 @@
 
 ## Возможности
 
-- бюджеты по финансовому году, Budget Holder, Cost Center, WBS и Cost Element;
+- бюджеты по финансовому году, Budget Holder, Cost Center, WBS и Cost Element —
+  все они выбираются из справочников, а не вводятся текстом;
+- справочники Function, Sub-function, Project, WBS, Cost Center, Cost Element,
+  Budget Holder, Vendor и валюты с полным CRUDL;
+- структурный WBS: `Function(2) / Sub-function(4) / Project.extension`,
+  уникальный, с обязательным бюджетом на каждый элемент;
+- все денежные значения — `decimal` с двумя знаками (полей «в центах» нет);
 - approved и released budget;
 - помесячный план бюджета: распределение по 12 месяцам финансового года,
   факт и остаток по каждому месяцу, мягкий контроль превышения;
@@ -44,6 +50,79 @@ curl http://localhost:8080/api/summary
 контейнера, и за Basic Auth контейнер уходил бы в статус `unhealthy`. Эндпоинт
 не отдаёт ничего, кроме признака доступности. Все остальные маршруты, включая
 `/api/summary`, закрыты, если заданы `APP_USER` и `APP_PASSWORD`.
+
+## Справочники и WBS
+
+Каждая сущность ведётся в справочнике (`/references`), документы ссылаются на
+записи по id:
+
+| Справочник | Страница | Правило кода |
+|---|---|---|
+| Function | `/references/functions` | ровно 2 знака (`A–Z`, `0–9`) |
+| Sub-function | `/references/sub-functions` | ровно 4 знака, принадлежит функции |
+| Project | `/references/projects` | до 15 знаков (`A–Z`, `0–9`, дефис) |
+| Cost Center | `/references/cost-centers` | `A–Z`, `0–9`, дефис |
+| Cost Element | `/references/cost-elements` | `A–Z`, `0–9`, дефис |
+| Budget Holder | `/references/holders` | код + имя + email |
+| Vendor | `/references/vendors` | код + название |
+| WBS-элементы | `/wbs` | собирается из уровней, см. ниже |
+| Валюты | `/settings` | трёхбуквенный код + курс ЦБ РФ |
+
+Запись справочника нельзя удалить, пока на неё кто-то ссылается.
+
+### Формирование WBS
+
+```text
+<префикс><Function>/<Sub-function>/<Project>.<extension>
+             2 знака      4 знака    3-й и 4-й уровни: не более 15 знаков вместе
+```
+
+- полный WBS начинается с кода-префикса (`/settings` → «Кодирование WBS»);
+  по умолчанию префикс пустой, и WBS начинается прямо с кода функции;
+- при изменении префикса или кода любого уровня коды всех WBS-элементов
+  пересобираются автоматически;
+- WBS **уникален**: одному WBS-элементу соответствует ровно одна бюджетная
+  строка (`budget_lines.wbs_element_id` — `NOT NULL UNIQUE`);
+- **бюджет должен быть создан для каждого** WBS-элемента: на страницах `/wbs` и
+  `/budgets` выводится число элементов без бюджета, а в списке WBS у каждого
+  такого элемента есть кнопка «Создать бюджет» (`/budgets?wbs={id}`);
+- субфункция должна принадлежать выбранной функции, иначе элемент не сохранится.
+
+<!-- English: every entity is kept in a reference catalog under /references and
+     documents point at catalog entries by id. A WBS element is assembled from
+     Function (2 chars) / Sub-function (4 chars) / Project.extension, where the
+     project and extension together may not exceed 15 characters. The full WBS
+     starts with the prefix code configured on /settings (empty by default).
+     Changing the prefix or any level code rebuilds every stored WBS code. A WBS
+     is unique and carries exactly one budget line, and both /wbs and /budgets
+     report the elements that still need a budget. -->
+
+## Денежные суммы
+
+Все суммы — `Decimal` с двумя знаками после запятой, и в приложении, и в базе:
+колонки объявлены `NUMERIC(18,2)` (курсы — `NUMERIC(18,6)`), отдельных полей с
+минимальными единицами (`*_cents`, `rate_micro`) больше нет.
+
+- ввод разбирается `parse_money()` и принимает `1 234,56` и `1,234.56`;
+- чтение из SQLite нормализует значение `dec()` — SQLite хранит `NUMERIC` как
+  INTEGER или REAL, поэтому значение всегда приводится обратно к двум знакам;
+- суммирование в SQL идёт через собственный агрегат `dsum()`, который
+  складывает `Decimal`, а не REAL, — итоги точны до копейки;
+- `/api/summary` отдаёт суммы строками (`"available": "48765.94"`), потому что
+  JSON-число — это двоичный float.
+
+База, созданная предыдущей версией, **мигрирует при старте**: суммы делятся на
+100, `rate_micro` — на 1 000 000, а текстовые Budget Holder, Vendor, Cost
+Center, Cost Element и WBS переносятся в справочники. WBS в стандартном формате
+разбирается на уровни; нераспознанный текст попадает в запасной элемент
+`ZZ/ZZZZ/<старый текст>`, который затем можно переоформить вручную.
+
+<!-- English: all amounts are two-decimal Decimals, stored in NUMERIC(18,2)
+     columns; no minor-unit integer fields remain. dec() normalises values read
+     back from SQLite and the custom dsum() aggregate keeps SQL summation exact.
+     /api/summary returns amounts as strings. A database from the previous
+     version is migrated on start: amounts are divided by 100, rates by 1e6, and
+     the free-text fields are folded into the new catalogs. -->
 
 ## Основная логика
 
@@ -102,6 +181,8 @@ Commitment PO = PO amount - expenses linked to this PO
 | PO        | `/pos/new`    | `/pos/{id}`       | `/pos/{id}/edit` (+ `/pos/{id}/status`) | `/pos/{id}/delete` | `/pos`        |
 | Расходы   | `/expenses/new` | `/expenses/{id}` | `/expenses/{id}/edit` | `/expenses/{id}/delete` | `/expenses`   |
 | Операции  | `/budgets/{id}/operation` | `/operations/{id}` | `/operations/{id}/edit` | `/operations/{id}/delete` | `/operations` |
+| Справочники | `/references/{slug}/new` | `/references/{slug}/{id}` | `/references/{slug}/{id}/edit` | `/references/{slug}/{id}/delete` | `/references`, `/references/{slug}` |
+| WBS       | `/wbs/new`    | `/wbs/{id}`       | `/wbs/{id}/edit`  | `/wbs/{id}/delete`  | `/wbs`        |
 
 Помесячный план бюджета сохраняется через `POST /budgets/{id}/allocations`
 (12 сумм; пустые поля означают 0, полностью пустая форма удаляет план).
@@ -111,6 +192,9 @@ Commitment PO = PO amount - expenses linked to this PO
 - любое изменение или удаление проверяется на инварианты бюджета
   (`Available ≥ 0` и `Released ≤ Approved`); нарушающая операция откатывается;
 - бюджет нельзя удалить, пока с ним связаны PO, расходы или операции;
+- запись справочника нельзя удалить, пока на неё ссылаются документы или
+  WBS-элементы; WBS-элемент нельзя удалить, пока по нему заведён бюджет;
+- WBS уникален, и повторное использование занятого WBS-элемента отклоняется;
 - PO нельзя удалить, пока по нему проведены расходы; редактируются только
   Draft и Approved PO, а сумма PO не может быть меньше уже проведённых расходов;
 - удаление или редактирование операции пересчитывает дельты и заново проверяет
@@ -349,10 +433,26 @@ python3 -m unittest -v
 атомарны и бюджет нельзя перерасходовать.
 
 Также покрыты парсинг курсов ЦБ РФ (`parse_cbr_rates`), конвертация валют
-(`convert_cents`), обновление курсов (`refresh_rates` с подменой сетевого
+(`convert_money`), обновление курсов (`refresh_rates` с подменой сетевого
 запроса) и настройки (`get_setting`/`set_setting`) — всё без обращения к сети.
 
 Помесячный план покрыт тестами `monthly_metrics` (группировка факта по месяцам,
 флаг превышения, расходы вне финансового года), `spread_evenly`,
-`money_to_cents_or_zero`, а также проверкой автоматического обновления схемы
+`parse_money_or_zero`, а также проверкой автоматического обновления схемы
 существующей БД при рестарте (`init_db`).
+
+Отдельно проверяются:
+
+- **decimal-суммы**: приведение всех представлений SQLite через `dec()`,
+  точность агрегата `dsum()` на 300 суммах по `0.01`, round-trip суммы через БД
+  и отсутствие в схеме колонок `*_cents` / `*_micro`;
+- **WBS**: длины уровней (2/4) и лимит 15 знаков для проекта с extension,
+  алфавит кодов, префикс в начале полного WBS, уникальность кода и связи
+  «один WBS — один бюджет», пересборка кодов после смены префикса, список
+  элементов без бюджета;
+- **справочники**: идемпотентность `ref_get_or_create`, уникальность кода
+  субфункции в пределах функции, соответствие спецификаций `REFERENCES` схеме и
+  каталогу переводов;
+- **миграция** старой БД: суммы, курсы, перенос текстовых полей в справочники,
+  разбор стандартного WBS и запасной элемент для нераспознанного, идемпотентность
+  повторного запуска.
