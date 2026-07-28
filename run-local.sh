@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
+# Run without Docker. Only DATA_DIR differs from the container defaults — a
+# relative path so nothing tries to write /data on a developer machine.
+# Everything else comes from the application's own environment handling, so
+# the defaults live in exactly one place.
 set -eu
-mkdir -p "${DATA_DIR:-./data}"
-export DB_PATH="${DB_PATH:-${DATA_DIR:-./data}/budget.db}"
-export PORT="${PORT:-8080}"
-export SEED_DEMO="${SEED_DEMO:-1}"
+export DATA_DIR="${DATA_DIR:-./data}"
 exec python3 app.py

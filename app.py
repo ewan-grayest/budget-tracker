@@ -16,20 +16,92 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
-APP_NAME = "Budget Control"
-DB_PATH = os.getenv("DB_PATH", "/data/budget.db")
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8080"))
-APP_USER = os.getenv("APP_USER", "")
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-SEED_DEMO = os.getenv("SEED_DEMO", "1") == "1"
+# --------------------------------------------------------------------------- #
+# Configuration                                                                #
+# --------------------------------------------------------------------------- #
+# Every deployment knob is read from the environment here, so the image itself
+# carries no baked-in settings and the same build runs unmodified on a laptop,
+# a plain Docker host, or a PaaS that injects its own values.
+
+
+def env_str(name, default):
+    """Environment override, treating an empty value as unset.
+
+    Platforms routinely hand over blank variables for unset settings; falling
+    back to the default keeps that from becoming an empty hostname or path.
+    """
+    value = os.getenv(name)
+    return default if value is None or value.strip() == "" else value.strip()
+
+
+def env_bool(name, default):
+    value = env_str(name, "1" if default else "0").lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(f"{name} must be a boolean (1/0, true/false, yes/no, on/off), got {value!r}")
+
+
+def env_octal(name, default):
+    raw = env_str(name, default)
+    try:
+        return int(raw, 8)
+    except ValueError:
+        raise SystemExit(f"{name} must be an octal file mode such as 0660, got {raw!r}")
+
+
+def env_int(name, default, minimum=None, maximum=None):
+    raw = env_str(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}")
+    if minimum is not None and value < minimum:
+        raise SystemExit(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise SystemExit(f"{name} must be <= {maximum}, got {value}")
+    return value
+
+
+APP_NAME = env_str("APP_NAME", "Budget Control")
+# Every persistent file the app owns lives under DATA_DIR, so mounting that one
+# path is enough to preserve state. DB_PATH stays separately overridable for
+# deployments that keep the database somewhere else entirely.
+DATA_DIR = env_str("DATA_DIR", "/data")
+DB_PATH = env_str("DB_PATH", os.path.join(DATA_DIR, "budget.db"))
+DB_TIMEOUT = env_int("DB_TIMEOUT", 30, minimum=1)
+# SQLite creates its files 0644 whatever the umask, and umask can only clear
+# bits, never add them. Hosts that assign a fresh uid on every start keep the
+# gid stable, so the group needs write access or the next container cannot open
+# the database it just inherited.
+DATA_FILE_MODE = env_octal("DATA_FILE_MODE", "0660")
+HOST = env_str("HOST", "0.0.0.0")
+# Hosting platforms inject the port they routed to the container, and runtime
+# environment beats the image's own default.
+PORT = env_int("PORT", 8080, minimum=1, maximum=65535)
+APP_USER = env_str("APP_USER", "")
+APP_PASSWORD = env_str("APP_PASSWORD", "")
+SEED_DEMO = env_bool("SEED_DEMO", True)
+# auto: mark cookies Secure only when the request arrived over HTTPS, which
+# behind a terminating proxy is what X-Forwarded-Proto reports. Forcing 1 or 0
+# covers proxies that do not send the header.
+COOKIE_SECURE = env_str("COOKIE_SECURE", "auto").lower()
+if COOKIE_SECURE not in ("auto", "1", "0", "true", "false", "yes", "no", "on", "off"):
+    raise SystemExit(f"COOKIE_SECURE must be auto, 1 or 0, got {COOKIE_SECURE!r}")
+# Header a terminating proxy uses to report the original scheme. Empty disables
+# the lookup, which is what you want when nothing in front of the app is trusted
+# to set it.
+FORWARDED_PROTO_HEADER = env_str("FORWARDED_PROTO_HEADER", "X-Forwarded-Proto")
 
 # --------------------------------------------------------------------------- #
 # Internationalization (i18n)                                                  #
 # --------------------------------------------------------------------------- #
-DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")   # UI language when nothing else is set
 LANGUAGES = ("en", "ru")                          # supported UI languages (switcher order)
 LANG_COOKIE = "lang"                              # cookie remembering the visitor's choice
+DEFAULT_LANG = env_str("DEFAULT_LANG", "en")      # UI language when nothing else is set
+if DEFAULT_LANG not in LANGUAGES:
+    raise SystemExit(f"DEFAULT_LANG must be one of {', '.join(LANGUAGES)}, got {DEFAULT_LANG!r}")
 
 # Message catalog. Every user-visible string lives here under a dotted key, and
 # both language blocks carry the SAME set of keys. The Russian block is
@@ -678,7 +750,7 @@ def db(write=False):
     # followed by a write is atomic against other writers. Without it two
     # concurrent requests could both pass an "available budget" check and
     # both commit, overspending the budget (TOCTOU race).
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -1085,7 +1157,8 @@ def esc(value):
 # --------------------------------------------------------------------------- #
 # Rates are stored relative to RUB (the CBR base) as integers scaled by 1e6:
 # rate_micro = round(rate_to_RUB_per_unit * 1_000_000). RUB itself is 1.0.
-CBR_URL = os.getenv("CBR_URL", "https://www.cbr.ru/scripts/XML_daily.asp")
+CBR_URL = env_str("CBR_URL", "https://www.cbr.ru/scripts/XML_daily.asp")
+CBR_TIMEOUT = env_int("CBR_TIMEOUT", 10, minimum=1)
 RUB_MICRO = 1_000_000
 
 
@@ -1161,14 +1234,14 @@ def parse_cbr_rates(xml_text):
     return out
 
 
-def fetch_cbr_rates(url=None, timeout=10):
+def fetch_cbr_rates(url=None, timeout=None):
     """Fetch and parse today's CBR rates. Network is isolated from parsing so
     tests can stub this out. Raises ValueError on any network/parse failure."""
     import urllib.error
     import urllib.request
     req = urllib.request.Request(url or CBR_URL, headers={"User-Agent": "BudgetControl/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or CBR_TIMEOUT) as resp:
             raw = resp.read()
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ValueError(str(exc))
@@ -1254,6 +1327,23 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
+    def cookie_secure_attr(self):
+        """`; Secure` when cookies should be HTTPS-only, else empty.
+
+        Hosting platforms terminate TLS in front of the container, so the
+        connection here is plain HTTP and only the forwarded-scheme header can
+        tell us what the browser actually used.
+        """
+        if COOKIE_SECURE in ("1", "true", "yes", "on"):
+            return "; Secure"
+        if COOKIE_SECURE in ("0", "false", "no", "off"):
+            return ""
+        if not FORWARDED_PROTO_HEADER:
+            return ""
+        # A chain of proxies appends to the header; the client-facing hop is first.
+        proto = self.headers.get(FORWARDED_PROTO_HEADER, "").split(",")[0].strip().lower()
+        return "; Secure" if proto == "https" else ""
+
     def csrf_token(self):
         cached = getattr(self, "_csrf_cache", None)
         if cached:
@@ -1299,11 +1389,12 @@ class AppHandler(BaseHTTPRequestHandler):
             "Content-Security-Policy",
             "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
+        secure = self.cookie_secure_attr()
         if is_new:
-            self.send_header("Set-Cookie", f"csrf_token={token}; Path=/; SameSite=Strict; HttpOnly")
+            self.send_header("Set-Cookie", f"csrf_token={token}; Path=/; SameSite=Strict; HttpOnly{secure}")
         pending_lang = getattr(self, "_set_lang_cookie", None)
         if pending_lang:
-            self.send_header("Set-Cookie", f"{LANG_COOKIE}={pending_lang}; Path=/; SameSite=Lax")
+            self.send_header("Set-Cookie", f"{LANG_COOKIE}={pending_lang}; Path=/; SameSite=Lax{secure}")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2354,8 +2445,47 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_json({"budgets": payload})
 
 
+def ensure_writable(path, label):
+    """Fail fast with an actionable message rather than a stack trace.
+
+    A volume attached by the hosting platform arrives owned by root more often
+    than not, and "unable to open database file" several frames deep is a poor
+    way to learn that.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"cannot create {label} {path!r}: {exc}")
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise SystemExit(
+            f"{label} {path!r} is not writable by uid={os.getuid()} gid={os.getgid()}. "
+            f"Mount it writable for that account, start the container as root so the "
+            f"entrypoint can take ownership, or point {label} at a writable path."
+        )
+
+
+def apply_data_file_mode():
+    """Relax the database files to DATA_FILE_MODE so a later container running
+    under a different uid in the same group can still open them. Failure is not
+    fatal: another account may own the files, and being unable to widen the
+    mode is only a problem if the uid actually changes."""
+    for suffix in ("", "-wal", "-shm"):
+        target = DB_PATH + suffix
+        try:
+            os.chmod(target, DATA_FILE_MODE)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"warning: cannot set mode {DATA_FILE_MODE:04o} on {target!r}: {exc}")
+
+
 def main():
+    ensure_writable(DATA_DIR, "DATA_DIR")
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir != os.path.abspath(DATA_DIR):
+        ensure_writable(db_dir, "DB_PATH directory")
     init_db()
+    apply_data_file_mode()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
 
     def shutdown(signum, _frame):

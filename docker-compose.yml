@@ -1,40 +1,88 @@
+# Every value below comes from the environment with a default, so the same file
+# works unchanged across machines. Copy .env.example to .env to override.
 services:
   budget-manager:
-    build: .
-    container_name: budget-manager
-    restart: unless-stopped
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-0}
+        DATA_DIR: ${DATA_DIR:-/data}
+        APP_PORT: ${PORT:-8080}
+    image: ${IMAGE_NAME:-budget-manager}:${IMAGE_TAG:-local}
+    container_name: ${CONTAINER_NAME:-budget-manager}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    # Set to "0:0" on hosts that attach the volume owned by root: the entrypoint
+    # takes ownership and then drops back to RUN_UID:RUN_GID. Doing so also needs
+    # the cap_add block below.
+    user: ${CONTAINER_USER:-10001:0}
     # Reaps orphans and forwards signals even if the entrypoint ever stops
     # handling SIGTERM itself.
     init: true
     ports:
-      # Loopback only: Basic Auth sends credentials in cleartext, so anything
-      # beyond this host belongs behind a TLS-terminating reverse proxy.
-      - "127.0.0.1:8080:8080"
+      # Loopback by default: Basic Auth sends credentials in cleartext, so
+      # anything beyond this host belongs behind a TLS-terminating proxy. Set
+      # BIND_ADDRESS=0.0.0.0 once such a proxy is in place.
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8080}:${PORT:-8080}"
     environment:
-      DB_PATH: /data/budget.db
-      SEED_DEMO: "1"
-      # Раскомментируйте для Basic Auth:
-      # APP_USER: admin
-      # APP_PASSWORD: change-me
+      DATA_DIR: ${DATA_DIR:-/data}
+      DB_PATH: ${DB_PATH:-}
+      DB_TIMEOUT: ${DB_TIMEOUT:-30}
+      DATA_FILE_MODE: ${DATA_FILE_MODE:-0660}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8080}
+      APP_NAME: ${APP_NAME:-}
+      APP_USER: ${APP_USER:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+      SEED_DEMO: ${SEED_DEMO:-1}
+      DEFAULT_LANG: ${DEFAULT_LANG:-en}
+      CBR_URL: ${CBR_URL:-}
+      CBR_TIMEOUT: ${CBR_TIMEOUT:-10}
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      FORWARDED_PROTO_HEADER: ${FORWARDED_PROTO_HEADER:-X-Forwarded-Proto}
+      RUN_UID: ${APP_UID:-10001}
+      RUN_GID: ${APP_GID:-0}
+      UMASK: ${UMASK:-0002}
     volumes:
-      - budget_data:/data
-    # The app writes only to /data; SQLite may want scratch space under /tmp.
-    read_only: true
+      - budget_data:${DATA_DIR:-/data}
+    # The app writes only to DATA_DIR; SQLite may want scratch space under /tmp.
+    read_only: ${READ_ONLY_ROOT:-true}
     tmpfs:
       - /tmp
     cap_drop:
       - ALL
+    # Uncomment together with CONTAINER_USER=0:0 when the host attaches a
+    # root-owned volume and the entrypoint has to chown it before dropping
+    # privileges. Not needed in the default non-root configuration.
+    # cap_add:
+    #   - CHOWN
+    #   - FOWNER
+    #   - DAC_OVERRIDE
+    #   - SETUID
+    #   - SETGID
     security_opt:
       - no-new-privileges:true
-    mem_limit: 256m
-    cpus: 1.0
+    mem_limit: ${MEM_LIMIT:-256m}
+    cpus: ${CPU_LIMIT:-1.0}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8080') + '/healthz', timeout=2)
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-3s}
+      start_period: ${HEALTHCHECK_START_PERIOD:-5s}
+      retries: ${HEALTHCHECK_RETRIES:-3}
     # Every request is logged to stdout, so cap the json-file driver or a
     # long-running host fills its disk.
     logging:
-      driver: json-file
+      driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: ${LOG_MAX_SIZE:-10m}
+        max-file: ${LOG_MAX_FILE:-3}
 
 volumes:
   budget_data:
+    name: ${VOLUME_NAME:-budget_data}
