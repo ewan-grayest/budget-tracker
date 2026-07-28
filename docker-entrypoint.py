@@ -81,9 +81,16 @@ def prepare_data_dir(path, uid, gid, chown):
                 # it so the group keeps write access across a uid change.
                 os.chmod(entry.path, entry.stat().st_mode | 0o060)
     except OSError as exc:
-        # Dropping CAP_CHOWN is a legitimate configuration; carry on and let
-        # the writability check decide whether this is actually fatal.
-        print(f"entrypoint: could not adjust ownership of {path!r}: {exc}", file=sys.stderr)
+        # Running without CAP_CHOWN is a legitimate configuration, and the mount
+        # may well be writable already, so carry on and let the application's
+        # own check decide whether this is actually fatal.
+        print(
+            f"entrypoint: could not hand {path!r} to {uid}:{gid}: {exc}. "
+            f"If the application then reports the directory as unwritable, grant the "
+            f"container the CHOWN, FOWNER and DAC_OVERRIDE capabilities, or mount the "
+            f"volume already owned by {uid}:{gid}.",
+            file=sys.stderr,
+        )
 
 
 def drop_privileges(uid, gid):

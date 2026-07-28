@@ -2457,10 +2457,17 @@ def ensure_writable(path, label):
     except OSError as exc:
         raise SystemExit(f"cannot create {label} {path!r}: {exc}")
     if not os.access(path, os.W_OK | os.X_OK):
+        try:
+            info = os.stat(path)
+            owner = f"owned by uid={info.st_uid} gid={info.st_gid}, mode {info.st_mode & 0o7777:04o}"
+        except OSError as exc:
+            owner = f"could not be inspected: {exc}"
         raise SystemExit(
-            f"{label} {path!r} is not writable by uid={os.getuid()} gid={os.getgid()}. "
-            f"Mount it writable for that account, start the container as root so the "
-            f"entrypoint can take ownership, or point {label} at a writable path."
+            f"{label} {path!r} is not writable by uid={os.getuid()} gid={os.getgid()}; "
+            f"it is {owner}. Either start the container as root so the entrypoint can "
+            f"take ownership (it drops privileges again before this point, and needs "
+            f"the CHOWN capability to do so), have the platform mount it writable for "
+            f"that account, or point {label} at a writable path."
         )
 
 

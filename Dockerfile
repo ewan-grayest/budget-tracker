@@ -34,7 +34,16 @@ RUN set -eux; \
     chown -R "${APP_UID}:${APP_GID}" /app "${DATA_DIR}"; \
     chmod -R g+rwX "${DATA_DIR}"
 
-USER ${APP_UID}:${APP_GID}
+# Deliberately no USER: the container starts as root so the entrypoint can take
+# ownership of a volume the host attached as root:root, which is how most
+# managed platforms attach one. The entrypoint then drops to RUN_UID:RUN_GID and
+# refuses to start the application as root, so root exists only for the few
+# syscalls that need it. Pinning USER here instead would leave the entrypoint
+# powerless exactly when the fix is needed.
+#
+# Hosts that manage volume ownership themselves (Kubernetes fsGroup, or a plain
+# `docker run --user 10001:0`) can still start unprivileged: the entrypoint
+# detects that and execs straight through.
 # Metadata only; EXPOSE cannot read a runtime $PORT, the healthcheck below can.
 EXPOSE ${APP_PORT}
 # No VOLUME directive: docker-compose.yml supplies the named volume, and

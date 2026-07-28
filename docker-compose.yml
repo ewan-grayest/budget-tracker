@@ -13,10 +13,12 @@ services:
     image: ${IMAGE_NAME:-budget-manager}:${IMAGE_TAG:-local}
     container_name: ${CONTAINER_NAME:-budget-manager}
     restart: ${RESTART_POLICY:-unless-stopped}
-    # Set to "0:0" on hosts that attach the volume owned by root: the entrypoint
-    # takes ownership and then drops back to RUN_UID:RUN_GID. Doing so also needs
-    # the cap_add block below.
-    user: ${CONTAINER_USER:-10001:0}
+    # Start as root so the entrypoint can take ownership of a root-owned volume,
+    # which is how most hosts attach one. It drops to RUN_UID:RUN_GID before the
+    # application starts, and refuses to run it as root. Set
+    # CONTAINER_USER=10001:0 when the platform manages the mount's ownership
+    # itself; the cap_add block below then becomes unnecessary.
+    user: ${CONTAINER_USER:-0:0}
     # Reaps orphans and forwards signals even if the entrypoint ever stops
     # handling SIGTERM itself.
     init: true
@@ -52,15 +54,16 @@ services:
       - /tmp
     cap_drop:
       - ALL
-    # Uncomment together with CONTAINER_USER=0:0 when the host attaches a
-    # root-owned volume and the entrypoint has to chown it before dropping
-    # privileges. Not needed in the default non-root configuration.
-    # cap_add:
-    #   - CHOWN
-    #   - FOWNER
-    #   - DAC_OVERRIDE
-    #   - SETUID
-    #   - SETGID
+    # The minimum the entrypoint needs to hand a root-owned volume over and then
+    # drop privileges. Everything else stays dropped, and the application itself
+    # runs without any of these. Remove the block when CONTAINER_USER is an
+    # unprivileged account.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
     security_opt:
       - no-new-privileges:true
     mem_limit: ${MEM_LIMIT:-256m}
