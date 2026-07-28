@@ -4,16 +4,21 @@
 Uses only the standard library (unittest), matching the app's zero-dependency
 design. Run with:  python3 -m unittest -v   (or)   python3 test_app.py
 """
+import http.cookiejar
 import os
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 
-# The app reads DB_PATH / SEED_DEMO at import time, so configure the
-# environment before importing it.
+# The app reads DB_PATH at import time, so configure the environment before
+# importing it.
 _TMPDIR = tempfile.mkdtemp(prefix="budget-test-")
 os.environ["DB_PATH"] = os.path.join(_TMPDIR, "test.db")
-os.environ["SEED_DEMO"] = "0"
 
 import app  # noqa: E402
 
@@ -78,6 +83,42 @@ class DBTestBase(unittest.TestCase):
                 "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
                 [(budget_id, m, v) for m, v in alloc.items()],
             )
+
+    def _seed_demo(self):
+        """Recreate the demo records earlier versions wrote into an empty
+        database, and clear the purge marker so purge_demo_data() runs as it
+        would on a database created by such a version."""
+        now = "2026-01-01T00:00:00Z"
+        with app.db(write=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO budget_lines({},created_at) VALUES({},?)".format(
+                    ",".join(app.DEMO_BUDGET), ",".join("?" * len(app.DEMO_BUDGET))),
+                (*app.DEMO_BUDGET.values(), now),
+            )
+            budget_id = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO purchase_orders({},budget_id,created_at) VALUES({},?,?)".format(
+                    ",".join(app.DEMO_PO), ",".join("?" * len(app.DEMO_PO))),
+                (*app.DEMO_PO.values(), budget_id, now),
+            )
+            po_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO expenses({},budget_id,po_id,expense_date,created_at) VALUES({},?,?,?,?)".format(
+                    ",".join(app.DEMO_EXPENSE), ",".join("?" * len(app.DEMO_EXPENSE))),
+                (*app.DEMO_EXPENSE.values(), budget_id, po_id, "2026-01-01", now),
+            )
+            conn.executemany(
+                "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
+                [(budget_id, i + 1, v) for i, v in enumerate(app.spread_evenly(10000000))],
+            )
+            conn.execute("DELETE FROM app_settings WHERE key='demo_purged'")
+        return budget_id, po_id
+
+    def _counts(self):
+        with app.db() as conn:
+            return tuple(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                         for table in ("budget_lines", "purchase_orders", "expenses",
+                                       "budget_monthly_allocations"))
 
 
 class MoneyToCentsTests(unittest.TestCase):
@@ -553,6 +594,277 @@ class RefreshRatesTests(DBTestBase):
         with app.db() as conn:
             rub = conn.execute("SELECT rate_micro FROM currencies WHERE code='RUB'").fetchone()["rate_micro"]
         self.assertEqual(rub, 1_000_000)  # never overwritten from the feed
+
+
+class DemoPurgeTests(DBTestBase):
+    def test_fresh_database_starts_empty(self):
+        # init_db() no longer seeds anything: a new deployment shows no records.
+        self.assertEqual(self._counts(), (0, 0, 0, 0))
+
+    def test_removes_untouched_demo_records(self):
+        self._seed_demo()
+        self.assertEqual(self._counts(), (1, 1, 1, 12))
+        app.purge_demo_data()
+        self.assertEqual(self._counts(), (0, 0, 0, 0))
+        with app.db() as conn:
+            self.assertEqual(app.get_setting(conn, "demo_purged"), "1")
+
+    def test_is_idempotent(self):
+        self._seed_demo()
+        app.purge_demo_data()
+        app.purge_demo_data()  # marker set: second run is a no-op, not an error
+        self.assertEqual(self._counts(), (0, 0, 0, 0))
+
+    def test_no_op_without_demo_data(self):
+        bid = self._add_budget(code="REAL-2026")
+        with app.db(write=True) as conn:
+            conn.execute("DELETE FROM app_settings WHERE key='demo_purged'")
+        app.purge_demo_data()
+        with app.db() as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM budget_lines WHERE id=?", (bid,)).fetchone())
+
+    def test_keeps_edited_demo_budget(self):
+        # Somebody adopted the demo line for real budgeting: it no longer
+        # matches the seeded values, so nothing of it may be deleted.
+        budget_id, _ = self._seed_demo()
+        with app.db(write=True) as conn:
+            conn.execute("UPDATE budget_lines SET name='Real IT budget' WHERE id=?", (budget_id,))
+        app.purge_demo_data()
+        self.assertEqual(self._counts(), (1, 1, 1, 12))
+
+    def test_keeps_demo_budget_carrying_own_expenses(self):
+        # The demo expense and PO still match and go; the budget line stays
+        # because a real expense hangs off it.
+        budget_id, _ = self._seed_demo()
+        self._add_expense(budget_id, 5000, expense_date="2026-03-01")
+        app.purge_demo_data()
+        with app.db() as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM budget_lines WHERE id=?", (budget_id,)).fetchone())
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM expenses").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM purchase_orders").fetchone()[0], 0)
+
+
+class RatesNeedRefreshTests(DBTestBase):
+    FEED = {"USD": ("Доллар США", 78_404_900), "EUR": ("Евро", 89_444_300)}
+
+    def _refresh(self):
+        with app.db(write=True) as conn:
+            app.refresh_rates(conn, fetch=lambda: self.FEED)
+
+    def test_true_when_an_active_currency_has_no_rate(self):
+        # Fresh catalog: USD and EUR are active but unrated.
+        with app.db() as conn:
+            self.assertTrue(app.rates_need_refresh(conn))
+
+    def test_false_right_after_a_refresh(self):
+        self._refresh()
+        with app.db() as conn:
+            # GBP/CNY/KZT stay unrated but are inactive, so they do not force a fetch.
+            self.assertFalse(app.rates_need_refresh(conn))
+
+    def test_true_once_older_than_max_age(self):
+        self._refresh()
+        later = datetime.now(timezone.utc) + timedelta(hours=25)
+        with app.db() as conn:
+            self.assertFalse(app.rates_need_refresh(conn, now=later, max_age_hours=48))
+            self.assertTrue(app.rates_need_refresh(conn, now=later, max_age_hours=24))
+
+    def test_true_when_timestamp_is_missing_or_broken(self):
+        self._refresh()
+        for value in ("", "not-a-timestamp"):
+            with app.db(write=True) as conn:
+                app.set_setting(conn, "rates_updated_at", value)
+            with app.db() as conn:
+                self.assertTrue(app.rates_need_refresh(conn), value)
+
+    def test_parse_iso_utc(self):
+        self.assertIsNone(app.parse_iso_utc("garbage"))
+        self.assertIsNone(app.parse_iso_utc(None))
+        self.assertEqual(app.parse_iso_utc("2026-07-28T10:00:00Z"),
+                         datetime(2026, 7, 28, 10, tzinfo=timezone.utc))
+        # A naive timestamp is read as UTC rather than local time.
+        self.assertEqual(app.parse_iso_utc("2026-07-28T10:00:00"),
+                         datetime(2026, 7, 28, 10, tzinfo=timezone.utc))
+
+
+class EnsureRatesTests(DBTestBase):
+    FEED = {"USD": ("Доллар США", 78_404_900), "EUR": ("Евро", 89_444_300)}
+
+    def setUp(self):
+        super().setUp()
+        self.calls = 0
+
+    def _fetch(self):
+        self.calls += 1
+        return self.FEED
+
+    def _boom(self):
+        self.calls += 1
+        raise ValueError("connection refused")
+
+    def test_loads_missing_rates_and_stops_once_fresh(self):
+        self.assertEqual(app.ensure_rates(fetch=self._fetch), 2)
+        with app.db() as conn:
+            self.assertEqual(app.load_rates(conn)["USD"], 78_404_900)
+            self.assertTrue(app.get_setting(conn, "rates_updated_at"))
+        # Rates are fresh now: no second network call.
+        self.assertIsNone(app.ensure_rates(fetch=self._fetch))
+        self.assertEqual(self.calls, 1)
+
+    def test_force_refetches_fresh_rates(self):
+        app.ensure_rates(fetch=self._fetch)
+        self.assertEqual(app.ensure_rates(fetch=self._fetch, force=True), 2)
+        self.assertEqual(self.calls, 2)
+
+    def test_failure_keeps_stored_rates_and_records_the_reason(self):
+        app.ensure_rates(fetch=self._fetch)
+        with self.assertRaises(ValueError):
+            app.ensure_rates(fetch=self._boom, force=True)
+        with app.db() as conn:
+            self.assertEqual(app.load_rates(conn)["USD"], 78_404_900)  # previous rates survive
+            self.assertIn("connection refused", app.get_setting(conn, "rates_last_error"))
+
+    def test_success_clears_a_previous_error(self):
+        with self.assertRaises(ValueError):
+            app.ensure_rates(fetch=self._boom)
+        app.ensure_rates(fetch=self._fetch)
+        with app.db() as conn:
+            self.assertEqual(app.get_setting(conn, "rates_last_error"), "")
+
+
+class PostRouteTests(unittest.TestCase):
+    def test_every_route_resolves_with_ids_and_a_question(self):
+        for path, handler, ids in (
+                ("/settings", "save_settings", []),
+                ("/settings/refresh-rates", "refresh_rates_action", []),
+                ("/budgets/new", "create_budget", []),
+                ("/budgets/7/operation", "create_operation", [7]),
+                ("/budgets/7/allocations", "save_allocations", [7]),
+                ("/budgets/7/edit", "update_budget", [7]),
+                ("/budgets/7/delete", "delete_budget", [7]),
+                ("/pos/new", "create_po", []),
+                ("/pos/3/status", "change_po_status", [3]),
+                ("/pos/3/edit", "update_po", [3]),
+                ("/pos/3/delete", "delete_po", [3]),
+                ("/expenses/new", "create_expense", []),
+                ("/expenses/5/edit", "update_expense", [5]),
+                ("/expenses/5/delete", "delete_expense", [5]),
+                ("/operations/9/edit", "update_operation", [9]),
+                ("/operations/9/delete", "delete_operation", [9])):
+            with self.subTest(path=path):
+                resolved, question, _danger, _kind, resolved_ids = app.match_post_route(path)
+                self.assertEqual((resolved, resolved_ids), (handler, ids))
+                self.assertTrue(hasattr(app.AppHandler, resolved))
+                # Every mutating route must carry a real confirmation prompt.
+                self.assertIn(question, app.TRANSLATIONS["en"])
+
+    def test_unknown_paths_do_not_match(self):
+        for path in ("/", "/budgets", "/budgets/7", "/nope", "/budgets/x/delete"):
+            self.assertIsNone(app.match_post_route(path))
+
+    def test_deletions_are_marked_destructive(self):
+        for _pattern, handler, _question, danger, _kind in app.POST_ROUTES:
+            self.assertEqual(danger, handler.startswith("delete_"), handler)
+
+
+class ConfirmationHttpTests(DBTestBase):
+    """End-to-end checks that no POST changes data before it is confirmed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        super().setUp()
+        self.jar = http.cookiejar.CookieJar()
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None  # inspect the 303 instead of following it
+
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar), NoRedirect)
+        self.opener.open(self.base + "/budgets?lang=en")  # issues the CSRF cookie
+
+    def _csrf(self):
+        return next(c.value for c in self.jar if c.name == "csrf_token")
+
+    def _post(self, path, fields, token=None):
+        body = urllib.parse.urlencode({**fields, "csrf_token": token or self._csrf()}).encode()
+        request = urllib.request.Request(self.base + path, data=body,
+                                         headers={"Referer": self.base + "/budgets"})
+        try:
+            response = self.opener.open(request)
+            return response.status, response.read().decode(), response.headers.get("Location")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode(), exc.headers.get("Location")
+
+    BUDGET = {"code": "IT-2027", "name": "IT", "fiscal_year": "2027", "currency": "RUB",
+              "holder_name": "Holder", "approved": "1000.00", "released": "1000.00"}
+
+    def test_create_writes_nothing_until_confirmed(self):
+        status, body, _ = self._post("/budgets/new", self.BUDGET)
+        self.assertEqual(status, 200)
+        self.assertIn('name="confirmed" value="1"', body)
+        self.assertIn("Create a budget with these values?", body)
+        self.assertIn("IT-2027", body)                       # the values are shown back
+        self.assertEqual(self._counts()[0], 0)               # and nothing was written
+
+        status, _, location = self._post("/budgets/new", {**self.BUDGET, "confirmed": "1"})
+        self.assertEqual(status, 303)
+        self.assertIn("/budgets", location)
+        self.assertEqual(self._counts()[0], 1)
+
+    def test_delete_writes_nothing_until_confirmed(self):
+        budget_id = self._add_budget(code="TO-DELETE")
+        status, body, _ = self._post("/budgets/%d/delete" % budget_id, {})
+        self.assertEqual(status, 200)
+        self.assertIn("Delete this budget?", body)
+        self.assertIn("cannot be undone", body)              # destructive routes warn
+        self.assertIn("TO-DELETE", body)                     # and name the record
+        self.assertEqual(self._counts()[0], 1)
+
+        status, _, _ = self._post("/budgets/%d/delete" % budget_id, {"confirmed": "1"})
+        self.assertEqual(status, 303)
+        self.assertEqual(self._counts()[0], 0)
+
+    def test_confirmed_post_still_needs_a_valid_csrf_token(self):
+        status, _, location = self._post(
+            "/budgets/new", {**self.BUDGET, "confirmed": "1"}, token="wrong-token")
+        self.assertEqual(status, 303)
+        self.assertIn("CSRF", urllib.parse.unquote_plus(location))
+        self.assertEqual(self._counts()[0], 0)
+
+    def test_validation_error_returns_to_the_originating_page(self):
+        # After confirmation the Referer is the confirmation page, so the back
+        # field is what must steer the error redirect.
+        status, _, location = self._post(
+            "/budgets/new", {**self.BUDGET, "approved": "nonsense",
+                             "confirmed": "1", "back": "/budgets"})
+        self.assertEqual(status, 303)
+        self.assertTrue(location.startswith("/budgets?"), location)
+        self.assertEqual(self._counts()[0], 0)
+
+    def test_back_field_cannot_redirect_off_site(self):
+        status, _, location = self._post(
+            "/budgets/new", {**self.BUDGET, "approved": "nonsense",
+                             "confirmed": "1", "back": "//evil.example/x"})
+        self.assertEqual(status, 303)
+        self.assertTrue(location.startswith("/?"), location)
+
+    def test_unknown_post_route_is_rejected(self):
+        status, _, location = self._post("/nope", {"confirmed": "1"})
+        self.assertEqual(status, 303)
+        self.assertIn("Unknown action", urllib.parse.unquote_plus(location))
 
 
 if __name__ == "__main__":

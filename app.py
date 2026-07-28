@@ -82,7 +82,6 @@ HOST = env_str("HOST", "0.0.0.0")
 PORT = env_int("PORT", 8080, minimum=1, maximum=65535)
 APP_USER = env_str("APP_USER", "")
 APP_PASSWORD = env_str("APP_PASSWORD", "")
-SEED_DEMO = env_bool("SEED_DEMO", True)
 # auto: mark cookies Secure only when the request arrived over HTTPS, which
 # behind a terminating proxy is what X-Forwarded-Proto reports. Forcing 1 or 0
 # covers proxies that do not send the header.
@@ -718,6 +717,97 @@ _MONTHLY_TRANSLATIONS = {
 for _lang, _msgs in _MONTHLY_TRANSLATIONS.items():
     TRANSLATIONS.setdefault(_lang, {}).update(_msgs)
 
+# Confirmation-step and automatic-rate strings. Same pattern again: the feature
+# adds its keys without touching the catalog above.
+_CONFIRM_TRANSLATIONS = {
+    "ru": {
+        # -- confirmation page chrome -------------------------------------- #
+        "title.confirm": "Подтверждение",                    # browser title
+        "h1.confirm": "Подтвердите операцию",                # confirmation page heading
+        "h2.confirm_details": "Что будет сделано",           # summary table heading
+        "col.field": "Поле",                                 # summary table — field name
+        "col.value": "Значение",                             # summary table — submitted value
+        "btn.confirm": "Подтвердить",                        # perform the operation
+        "btn.cancel_action": "Отмена",                       # go back without changing anything
+        "misc.confirm_irreversible": "Действие необратимо.",  # warning on destructive operations
+        "misc.empty_value": "—",                             # placeholder for a blank field
+
+        # -- per-operation questions --------------------------------------- #
+        "confirm.budget_create": "Создать бюджет с этими данными?",       # create budget
+        "confirm.budget_update": "Сохранить изменения бюджета?",          # update budget
+        "confirm.budget_delete": "Удалить бюджет?",                       # delete budget
+        "confirm.po_create": "Создать PO с этими данными?",               # create PO
+        "confirm.po_update": "Сохранить изменения PO?",                   # update PO
+        "confirm.po_delete": "Удалить PO?",                               # delete PO
+        "confirm.po_status": "Изменить статус PO?",                       # change PO status
+        "confirm.expense_create": "Провести расход с этими данными?",     # create expense
+        "confirm.expense_update": "Сохранить изменения расхода?",         # update expense
+        "confirm.expense_delete": "Удалить расход?",                      # delete expense
+        "confirm.operation_create": "Провести операцию с этими данными?",  # create operation
+        "confirm.operation_update": "Сохранить изменения операции?",      # update operation
+        "confirm.operation_delete": "Удалить операцию?",                  # delete operation
+        "confirm.allocations": "Сохранить помесячный план?",              # save monthly plan
+        "confirm.allocations_distribute": "Распределить released-бюджет равномерно по 12 месяцам? Текущий план будет заменён.",  # distribute evenly
+        "confirm.settings": "Сохранить настройки?",                       # save settings
+        "confirm.rates_refresh": "Загрузить курсы ЦБ РФ сейчас?",         # manual rate refresh
+
+        # -- record identity rows in the summary --------------------------- #
+        "confirm.record_budget": "Бюджет",       # which budget the operation applies to
+        "confirm.record_po": "PO",               # which PO
+        "confirm.record_expense": "Расход",      # which expense
+        "confirm.record_operation": "Операция",  # which operation
+
+        # -- automatic exchange rates -------------------------------------- #
+        "misc.rates_auto": "Курсы загружаются автоматически: проверка раз в {check} мин, обновление не реже чем раз в {hours} ч.",  # auto-refresh is on
+        "misc.rates_auto_off": "Автоматическое обновление курсов выключено (RATES_AUTO=0).",  # auto-refresh is off
+        "misc.rates_last_error": "Последняя автоматическая попытка не удалась: {detail}",     # last background failure
+    },
+    "en": {
+        # confirmation page chrome
+        "title.confirm": "Confirmation",
+        "h1.confirm": "Confirm the operation",
+        "h2.confirm_details": "What will happen",
+        "col.field": "Field",
+        "col.value": "Value",
+        "btn.confirm": "Confirm",
+        "btn.cancel_action": "Cancel",
+        "misc.confirm_irreversible": "This action cannot be undone.",
+        "misc.empty_value": "—",
+
+        # per-operation questions
+        "confirm.budget_create": "Create a budget with these values?",
+        "confirm.budget_update": "Save these changes to the budget?",
+        "confirm.budget_delete": "Delete this budget?",
+        "confirm.po_create": "Create a PO with these values?",
+        "confirm.po_update": "Save these changes to the PO?",
+        "confirm.po_delete": "Delete this PO?",
+        "confirm.po_status": "Change the PO status?",
+        "confirm.expense_create": "Post an expense with these values?",
+        "confirm.expense_update": "Save these changes to the expense?",
+        "confirm.expense_delete": "Delete this expense?",
+        "confirm.operation_create": "Post an operation with these values?",
+        "confirm.operation_update": "Save these changes to the operation?",
+        "confirm.operation_delete": "Delete this operation?",
+        "confirm.allocations": "Save the monthly plan?",
+        "confirm.allocations_distribute": "Spread the released budget evenly across 12 months? The current plan will be replaced.",
+        "confirm.settings": "Save the settings?",
+        "confirm.rates_refresh": "Fetch the CBR rates now?",
+
+        # record identity rows in the summary
+        "confirm.record_budget": "Budget",
+        "confirm.record_po": "PO",
+        "confirm.record_expense": "Expense",
+        "confirm.record_operation": "Operation",
+
+        # automatic exchange rates
+        "misc.rates_auto": "Rates load automatically: checked every {check} min, refreshed at least every {hours} h.",
+        "misc.rates_auto_off": "Automatic rate refresh is disabled (RATES_AUTO=0).",
+        "misc.rates_last_error": "The last automatic refresh failed: {detail}",
+    },
+}
+for _lang, _msgs in _CONFIRM_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_lang, {}).update(_msgs)
+
 
 def normalize_lang(value):
     """Return `value` if it is a supported language code, else None."""
@@ -855,11 +945,12 @@ def init_db():
             );
             """
         )
-        # Currency catalog and app settings are core configuration and are
-        # seeded regardless of SEED_DEMO. INSERT OR IGNORE keeps it idempotent
-        # and never clobbers a rate the operator has already refreshed. RUB is
-        # the CBR base: its rate is fixed at 1.0 (1_000_000 micro) and it stays
-        # active so it can always serve as the default display currency.
+        # The currency catalog and app settings are configuration, not sample
+        # data: without them there is nothing to pick a budget currency from.
+        # INSERT OR IGNORE keeps it idempotent and never clobbers a rate that
+        # has already been fetched. RUB is the CBR base: its rate is fixed at
+        # 1.0 (1_000_000 micro) and it stays active so it can always serve as
+        # the default display currency.
         conn.executemany(
             "INSERT OR IGNORE INTO currencies(code,name,rate_micro,is_active) VALUES(?,?,?,?)",
             [
@@ -872,47 +963,81 @@ def init_db():
             ],
         )
         conn.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES('base_currency','RUB')")
-        count = conn.execute("SELECT COUNT(*) FROM budget_lines").fetchone()[0]
-    if not (SEED_DEMO and count == 0):
-        return
+    purge_demo_data()
+
+
+# Fingerprint of the demo records earlier versions seeded into an empty
+# database. A row is only removed when every field still matches what was
+# written, so a line somebody adopted for real budgeting is never deleted.
+DEMO_BUDGET = {
+    "code": "IT-OPS-2026", "name": "IT Operations", "fiscal_year": 2026,
+    "holder_name": "Budget Holder", "holder_email": "holder@example.com",
+    "cost_center": "CC-IT", "wbs": "WBS-IT-OPS", "cost_element": "IT Services",
+    "currency": "EUR", "initial_approved_cents": 10000000, "initial_released_cents": 10000000,
+}
+DEMO_PO = {
+    "number": "PO-2026-0001", "vendor": "Example Vendor",
+    "description": "Infrastructure support, limit PO", "amount_cents": 2500000, "status": "APPROVED",
+}
+DEMO_EXPENSE = {
+    "invoice_no": "INV-DEMO-001", "description": "Monthly support services", "amount_cents": 700000,
+}
+
+
+def _matches(row, fingerprint):
+    return row is not None and all(row[key] == value for key, value in fingerprint.items())
+
+
+def purge_demo_data():
+    """Remove the demo records seeded by earlier versions, once.
+
+    The seeding is gone, but existing deployments keep their database on a
+    volume, so the demo budget/PO/expense would otherwise live on forever.
+    Deletion is conservative: each record goes only if it still matches the
+    seeded values exactly and nothing else references it. The run is recorded
+    in app_settings so a database that has been cleaned (or never seeded) does
+    no work on later starts.
+    """
+    with db() as conn:
+        if get_setting(conn, "demo_purged"):
+            return
+    removed = []
     with db(write=True) as conn:
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        conn.execute(
-            """INSERT INTO budget_lines
-            (code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,currency,
-             initial_approved_cents,initial_released_cents,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            ("IT-OPS-2026", "IT Operations", 2026, "Budget Holder", "holder@example.com",
-             "CC-IT", "WBS-IT-OPS", "IT Services", "EUR", 10000000, 10000000, now),
-        )
-        budget_id = conn.execute("SELECT id FROM budget_lines WHERE code='IT-OPS-2026'").fetchone()[0]
-        conn.execute(
-            """INSERT INTO purchase_orders
-            (number,budget_id,vendor,description,amount_cents,status,created_at)
-            VALUES (?,?,?,?,?,?,?)""",
-            ("PO-2026-0001", budget_id, "Example Vendor", "Infrastructure support, limit PO", 2500000, "APPROVED", now),
-        )
-        po_id = conn.execute("SELECT id FROM purchase_orders WHERE number='PO-2026-0001'").fetchone()[0]
-        conn.execute(
-            """INSERT INTO expenses
-            (budget_id,po_id,expense_date,invoice_no,description,amount_cents,created_at)
-            VALUES (?,?,?,?,?,?,?)""",
-            (budget_id, po_id, date.today().isoformat(), "INV-DEMO-001", "Monthly support services", 700000, now),
-        )
-        # Monthly plan: spread released evenly, then shrink the current month
-        # below the demo expense (moving the surplus to another month) so the
-        # seeded app immediately shows one over-plan month. Total still equals
-        # the released budget.
-        values = spread_evenly(10000000)
-        cur = date.today().month
-        dst = 0 if cur == 12 else 11
-        if values[cur - 1] > 500000:
-            values[dst] += values[cur - 1] - 500000
-            values[cur - 1] = 500000
-        conn.executemany(
-            "INSERT INTO budget_monthly_allocations(budget_id,month,allocated_cents) VALUES(?,?,?)",
-            [(budget_id, i + 1, v) for i, v in enumerate(values)],
-        )
+        budget = conn.execute("SELECT * FROM budget_lines WHERE code=?", (DEMO_BUDGET["code"],)).fetchone()
+        if _matches(budget, DEMO_BUDGET):
+            budget_id = budget["id"]
+            po = conn.execute(
+                "SELECT * FROM purchase_orders WHERE number=? AND budget_id=?",
+                (DEMO_PO["number"], budget_id),
+            ).fetchone()
+            if _matches(po, DEMO_PO):
+                expense = conn.execute(
+                    "SELECT * FROM expenses WHERE po_id=? AND budget_id=? AND invoice_no=?",
+                    (po["id"], budget_id, DEMO_EXPENSE["invoice_no"]),
+                ).fetchone()
+                if _matches(expense, DEMO_EXPENSE):
+                    conn.execute("DELETE FROM expenses WHERE id=?", (expense["id"],))
+                    removed.append(f"expense {DEMO_EXPENSE['invoice_no']}")
+                # Only an untouched PO goes: any expense somebody added of their
+                # own keeps it (and with it the budget line) in place.
+                if not conn.execute("SELECT 1 FROM expenses WHERE po_id=?", (po["id"],)).fetchone():
+                    conn.execute("DELETE FROM purchase_orders WHERE id=?", (po["id"],))
+                    removed.append(f"PO {DEMO_PO['number']}")
+            # Same linkage check delete_budget() applies: real documents attached
+            # to the line mean it is in use and must stay.
+            linked = conn.execute(
+                """SELECT (SELECT COUNT(*) FROM purchase_orders WHERE budget_id=?)
+                        + (SELECT COUNT(*) FROM expenses WHERE budget_id=?)
+                        + (SELECT COUNT(*) FROM budget_operations WHERE source_budget_id=? OR target_budget_id=?)""",
+                (budget_id, budget_id, budget_id, budget_id),
+            ).fetchone()[0]
+            if not linked:
+                conn.execute("DELETE FROM budget_monthly_allocations WHERE budget_id=?", (budget_id,))
+                conn.execute("DELETE FROM budget_lines WHERE id=?", (budget_id,))
+                removed.append(f"budget {DEMO_BUDGET['code']}")
+        set_setting(conn, "demo_purged", "1")
+    if removed:
+        print(f"removed demo data: {', '.join(removed)}")
 
 
 def money_to_cents(value, lang=DEFAULT_LANG):
@@ -1160,6 +1285,15 @@ def esc(value):
 CBR_URL = env_str("CBR_URL", "https://www.cbr.ru/scripts/XML_daily.asp")
 CBR_TIMEOUT = env_int("CBR_TIMEOUT", 10, minimum=1)
 RUB_MICRO = 1_000_000
+# Rates load themselves: nobody should have to press a button before the app
+# can convert anything. A background thread tops them up when they are missing
+# or stale, and they persist in the currencies table like any other data.
+RATES_AUTO = env_bool("RATES_AUTO", True)
+RATES_MAX_AGE_HOURS = env_int("RATES_MAX_AGE_HOURS", 24, minimum=1)
+RATES_RETRY_MINUTES = env_int("RATES_RETRY_MINUTES", 15, minimum=1)
+# How often the refresher wakes up to re-evaluate staleness. The check itself
+# is a couple of local queries; the network is touched only when it says so.
+RATES_CHECK_MINUTES = env_int("RATES_CHECK_MINUTES", 60, minimum=1)
 
 
 def get_setting(conn, key, default=None):
@@ -1275,6 +1409,152 @@ def refresh_rates(conn, fetch=fetch_cbr_rates):
         count += 1
     set_setting(conn, "rates_updated_at", now)
     return count
+
+
+def parse_iso_utc(value):
+    """Parse a timestamp written by this app back into an aware datetime.
+    Returns None for anything unparseable, so a corrupted setting is treated
+    as "no timestamp" rather than crashing the refresher."""
+    try:
+        parsed = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def rates_need_refresh(conn, now=None, max_age_hours=None):
+    """True when the stored rates are missing, incomplete or stale.
+
+    Incomplete means an active currency other than RUB has no rate at all —
+    that currency cannot be converted, which is exactly what a fresh install
+    looks like. Stale means the last successful fetch is older than
+    max_age_hours (CBR publishes daily). Pure and I/O-free apart from the two
+    lookups, so the policy can be unit-tested without a network or a clock.
+    """
+    now = now or datetime.now(timezone.utc)
+    max_age_hours = RATES_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
+    unrated = conn.execute(
+        "SELECT 1 FROM currencies WHERE is_active=1 AND code<>'RUB' AND rate_micro IS NULL LIMIT 1"
+    ).fetchone()
+    if unrated:
+        return True
+    updated = parse_iso_utc(get_setting(conn, "rates_updated_at"))
+    if updated is None:
+        return True
+    return (now - updated).total_seconds() >= max_age_hours * 3600
+
+
+# Serialises the manual button against the background refresher so the two
+# never fetch (and write) at the same time.
+_rates_lock = threading.Lock()
+
+
+def ensure_rates(fetch=fetch_cbr_rates, now=None, force=False):
+    """Load rates into the database when they are missing or stale.
+
+    Returns the number of currencies written, or None when nothing needed
+    doing. A failed fetch leaves the previously stored rates untouched and
+    records the reason in `rates_last_error` for the settings page, then
+    re-raises so the caller can report it: the refresh button turns it into an
+    error flash, the background refresher into a retry.
+    """
+    with _rates_lock:
+        with db() as conn:
+            if not force and not rates_need_refresh(conn, now=now):
+                return None
+        try:
+            # Fetched outside the write transaction: a slow or hanging CBR must
+            # never hold the database write lock against live requests.
+            rates = fetch()
+        except ValueError as exc:
+            with db(write=True) as conn:
+                set_setting(conn, "rates_last_error", str(exc))
+            raise
+        with db(write=True) as conn:
+            count = refresh_rates(conn, fetch=lambda: rates)
+            set_setting(conn, "rates_last_error", "")
+        return count
+
+
+def start_rate_refresher(stop_event, fetch=fetch_cbr_rates):
+    """Run ensure_rates() in the background for the life of the process.
+
+    The first pass happens immediately, so an empty database has its rates
+    shortly after startup without anyone visiting the settings page. Failures
+    are retried sooner than the regular check interval, and the whole loop is
+    driven by `stop_event` so shutdown does not wait on a sleep.
+    """
+    def loop():
+        while True:
+            try:
+                count = ensure_rates(fetch=fetch)
+                if count is not None:
+                    print(f"rates: loaded {count} currencies from {CBR_URL}")
+                delay = RATES_CHECK_MINUTES * 60
+            except ValueError as exc:
+                print(f"rates: refresh failed ({exc}); retrying in {RATES_RETRY_MINUTES} min")
+                delay = RATES_RETRY_MINUTES * 60
+            except Exception as exc:  # pragma: no cover - defensive: keep the thread alive
+                print(f"rates: unexpected refresh error {exc!r}; retrying in {RATES_RETRY_MINUTES} min")
+                delay = RATES_RETRY_MINUTES * 60
+            if stop_event.wait(delay):
+                return
+
+    thread = threading.Thread(target=loop, name="rate-refresher", daemon=True)
+    thread.start()
+    return thread
+
+
+# --------------------------------------------------------------------------- #
+# POST routing and the confirmation step                                       #
+# --------------------------------------------------------------------------- #
+# Every state-changing route in one table: (pattern, handler method, question
+# shown on the confirmation page, destructive?, record kind named in the
+# summary). Keeping it here rather than as an if-chain in do_POST means a new
+# mutating route cannot be added without also giving it a confirmation prompt.
+POST_ROUTES = (
+    (r"/settings", "save_settings", "confirm.settings", False, None),
+    (r"/settings/refresh-rates", "refresh_rates_action", "confirm.rates_refresh", False, None),
+    (r"/budgets/new", "create_budget", "confirm.budget_create", False, None),
+    (r"/budgets/(\d+)/operation", "create_operation", "confirm.operation_create", False, "budget"),
+    (r"/budgets/(\d+)/allocations", "save_allocations", "confirm.allocations", False, "budget"),
+    (r"/budgets/(\d+)/edit", "update_budget", "confirm.budget_update", False, "budget"),
+    (r"/budgets/(\d+)/delete", "delete_budget", "confirm.budget_delete", True, "budget"),
+    (r"/pos/new", "create_po", "confirm.po_create", False, None),
+    (r"/pos/(\d+)/status", "change_po_status", "confirm.po_status", False, "po"),
+    (r"/pos/(\d+)/edit", "update_po", "confirm.po_update", False, "po"),
+    (r"/pos/(\d+)/delete", "delete_po", "confirm.po_delete", True, "po"),
+    (r"/expenses/new", "create_expense", "confirm.expense_create", False, None),
+    (r"/expenses/(\d+)/edit", "update_expense", "confirm.expense_update", False, "expense"),
+    (r"/expenses/(\d+)/delete", "delete_expense", "confirm.expense_delete", True, "expense"),
+    (r"/operations/(\d+)/edit", "update_operation", "confirm.operation_update", False, "operation"),
+    (r"/operations/(\d+)/delete", "delete_operation", "confirm.operation_delete", True, "operation"),
+)
+
+
+def match_post_route(path):
+    """Resolve a POST path to (handler, question, danger, record_kind, ids)."""
+    for pattern, handler, question, danger, record_kind in POST_ROUTES:
+        m = re.fullmatch(pattern, path)
+        if m:
+            return handler, question, danger, record_kind, [int(g) for g in m.groups()]
+    return None
+
+
+# Form field -> translation key, for the confirmation summary. Fields not listed
+# here fall back to their own name (see confirm_field_label), which also covers
+# the generated alloc_<month> and active_<CODE> inputs.
+CONFIRM_FIELD_LABELS = {
+    "code": "label.code", "name": "label.name", "fiscal_year": "label.fiscal_year",
+    "currency": "label.currency", "holder_name": "label.holder", "holder_email": "label.email",
+    "cost_center": "label.cost_center", "wbs": "label.wbs", "cost_element": "label.cost_element",
+    "approved": "label.approved", "released": "label.released", "number": "label.number",
+    "budget_id": "label.budget", "vendor": "label.vendor", "amount": "label.amount",
+    "status": "label.status", "description": "label.description", "po_id": "label.po",
+    "expense_date": "label.date", "invoice_no": "label.invoice", "operation_type": "label.op_type",
+    "target_budget_id": "label.target_transfer", "note": "label.basis", "created_by": "label.executor",
+    "base_currency": "label.base_currency",
+}
 
 
 CSS = r"""
@@ -1466,8 +1746,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def lang_switch_links(self):
         """Render the RU/EN switcher, preserving the current path and query
-        (minus lang/flash params) so the visitor stays on the same page."""
-        parsed = urlparse(self.path)
+        (minus lang/flash params) so the visitor stays on the same page.
+
+        `_switch_path` overrides the request path on pages rendered in response
+        to a POST: the switcher builds GET links, and the POST-only URL of a
+        confirmation page would 404.
+        """
+        parsed = urlparse(getattr(self, "_switch_path", None) or self.path)
         params = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
         for drop in ("lang", "msg", "kind"):
             params.pop(drop, None)
@@ -1572,6 +1857,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         self.lang = self.resolve_lang()
         self._disp_loaded = False
+        self._switch_path = None
         if path == "/static/style.css":
             body = CSS.encode("utf-8")
             self.send_response(200)
@@ -1615,60 +1901,157 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         self.lang = self.resolve_lang()
+        self._switch_path = None
         path = urlparse(self.path).path
+        data = {}
         try:
             data = self.parse_post()
-            if path == "/settings":
-                return self.save_settings(data)
-            if path == "/settings/refresh-rates":
-                return self.refresh_rates_action(data)
-            if path == "/budgets/new":
-                return self.create_budget(data)
-            m = re.fullmatch(r"/budgets/(\d+)/operation", path)
-            if m:
-                return self.create_operation(int(m.group(1)), data)
-            m = re.fullmatch(r"/budgets/(\d+)/allocations", path)
-            if m:
-                return self.save_allocations(int(m.group(1)), data)
-            m = re.fullmatch(r"/budgets/(\d+)/edit", path)
-            if m:
-                return self.update_budget(int(m.group(1)), data)
-            m = re.fullmatch(r"/budgets/(\d+)/delete", path)
-            if m:
-                return self.delete_budget(int(m.group(1)), data)
-            if path == "/pos/new":
-                return self.create_po(data)
-            m = re.fullmatch(r"/pos/(\d+)/status", path)
-            if m:
-                return self.change_po_status(int(m.group(1)), data)
-            m = re.fullmatch(r"/pos/(\d+)/edit", path)
-            if m:
-                return self.update_po(int(m.group(1)), data)
-            m = re.fullmatch(r"/pos/(\d+)/delete", path)
-            if m:
-                return self.delete_po(int(m.group(1)), data)
-            if path == "/expenses/new":
-                return self.create_expense(data)
-            m = re.fullmatch(r"/expenses/(\d+)/edit", path)
-            if m:
-                return self.update_expense(int(m.group(1)), data)
-            m = re.fullmatch(r"/expenses/(\d+)/delete", path)
-            if m:
-                return self.delete_expense(int(m.group(1)), data)
-            m = re.fullmatch(r"/operations/(\d+)/edit", path)
-            if m:
-                return self.update_operation(int(m.group(1)), data)
-            m = re.fullmatch(r"/operations/(\d+)/delete", path)
-            if m:
-                return self.delete_operation(int(m.group(1)), data)
-            self.redirect("/", self.t("error.unknown_action"), True)
+            route = match_post_route(path)
+            if not route:
+                return self.redirect("/", self.t("error.unknown_action"), True)
+            handler_name, question, danger, record_kind, ids = route
+            record = (record_kind, ids[0]) if record_kind and ids else None
+            # Nothing is written until the operator has seen exactly what the
+            # request would do and pressed Confirm. The confirmation form
+            # re-posts this same payload with confirmed=1, so the handlers below
+            # stay unchanged and every route is covered by construction.
+            if data.get("confirmed") != "1":
+                if handler_name == "save_allocations" and data.get("action") == "distribute":
+                    question = "confirm.allocations_distribute"
+                # Approving a PO is undoable by cancelling it; closing or
+                # cancelling one is a one-way door and is flagged as such.
+                if handler_name == "change_po_status" and data.get("status", "").upper() in ("CLOSED", "CANCELLED"):
+                    danger = True
+                return self.confirm_page(path, data, question, danger, record)
+            return getattr(self, handler_name)(*ids, data)
         except (ValueError, sqlite3.IntegrityError) as exc:
-            back = self.headers.get("Referer", "/")
-            back_path = urlparse(back).path or "/"
-            self.redirect(back_path, str(exc), True)
+            self.redirect(self.back_path(data), str(exc), True)
         except Exception as exc:
             print("ERROR", repr(exc))
             self.redirect("/", self.t("error.internal"), True)
+
+    # ------------------------------------------------------------------ #
+    # Confirmation step shared by every state-changing POST              #
+    # ------------------------------------------------------------------ #
+    def back_path(self, data=None):
+        """Where Cancel and error messages return to.
+
+        The confirmation form carries the originating page in a hidden `back`
+        field, because by the time the confirmed POST arrives the Referer is the
+        confirmation page itself. Only the path is kept, so a foreign or
+        protocol-relative URL can never turn into an off-site redirect.
+        """
+        parsed = urlparse((data or {}).get("back") or self.headers.get("Referer", ""))
+        if parsed.netloc and parsed.netloc != self.headers.get("Host", ""):
+            return "/"
+        path = parsed.path or "/"
+        return path if path.startswith("/") and not path.startswith("//") else "/"
+
+    def confirm_field_label(self, field):
+        """Human-readable label for a submitted form field."""
+        key = CONFIRM_FIELD_LABELS.get(field)
+        if key:
+            return self.t(key)
+        m = re.fullmatch(r"alloc_(\d+)", field)
+        if m:
+            return self.t("month.%s" % m.group(1))
+        m = re.fullmatch(r"active_([A-Za-z]{3})", field)
+        if m:
+            return f"{m.group(1).upper()} — {self.t('col.active')}"
+        return field
+
+    def confirm_field_value(self, conn, field, value):
+        """Readable rendering of a submitted value.
+
+        Select inputs submit record ids, and confirming "3" would tell the
+        operator nothing, so a referenced budget or PO is resolved to its code
+        or number.
+        """
+        value = (value or "").strip()
+        if not value:
+            return self.t("misc.empty_value")
+        if field in ("budget_id", "target_budget_id"):
+            row = conn.execute("SELECT code,name FROM budget_lines WHERE id=?", (value,)).fetchone()
+            return f"{row['code']} — {row['name']}" if row else value
+        if field == "po_id":
+            row = conn.execute("SELECT number,vendor FROM purchase_orders WHERE id=?", (value,)).fetchone()
+            return f"{row['number']} — {row['vendor']}" if row else value
+        if field.startswith("active_") and value == "1":
+            return "✓"
+        return value
+
+    def record_summary(self, conn, kind, obj_id):
+        """Identity row(s) naming the record an operation applies to.
+
+        Delete requests carry no fields at all, so without this the operator
+        would be asked to confirm a bare "Delete this expense?".
+        """
+        if kind == "budget":
+            row = conn.execute("SELECT code,name FROM budget_lines WHERE id=?", (obj_id,)).fetchone()
+            if row:
+                return [(self.t("confirm.record_budget"), f"{row['code']} — {row['name']}")]
+        elif kind == "po":
+            row = conn.execute(
+                "SELECT po.number,po.vendor,po.amount_cents,po.status,b.currency FROM purchase_orders po "
+                "JOIN budget_lines b ON b.id=po.budget_id WHERE po.id=?", (obj_id,)).fetchone()
+            if row:
+                return [(self.t("confirm.record_po"),
+                         f"{row['number']} — {row['vendor']} · {row['status']} · "
+                         f"{self.money(row['amount_cents'], row['currency'])}")]
+        elif kind == "expense":
+            row = conn.execute(
+                "SELECT e.expense_date,e.description,e.amount_cents,b.currency FROM expenses e "
+                "JOIN budget_lines b ON b.id=e.budget_id WHERE e.id=?", (obj_id,)).fetchone()
+            if row:
+                return [(self.t("confirm.record_expense"),
+                         f"#{obj_id} · {row['expense_date']} · {row['description']} · "
+                         f"{self.money(row['amount_cents'], row['currency'])}")]
+        elif kind == "operation":
+            row = conn.execute(
+                "SELECT o.operation_type,o.amount_cents,s.code,s.currency FROM budget_operations o "
+                "LEFT JOIN budget_lines s ON s.id=o.source_budget_id WHERE o.id=?", (obj_id,)).fetchone()
+            if row:
+                return [(self.t("confirm.record_operation"),
+                         f"#{obj_id} · {row['operation_type']} · {row['code'] or ''} · "
+                         f"{self.money(row['amount_cents'], row['currency'] or '')}")]
+        return []
+
+    def confirm_page(self, action, data, question_key, danger=False, record=None):
+        """Render the "are you sure" page for a pending POST.
+
+        Every submitted field is echoed back as a hidden input, so pressing
+        Confirm replays the original request verbatim with confirmed=1 added.
+        The CSRF token is re-issued rather than echoed, and the page is served
+        as a plain 200 so a refresh simply asks again instead of acting.
+        """
+        rows = []
+        with db() as conn:
+            if record:
+                rows.extend(self.record_summary(conn, *record))
+            for field, value in data.items():
+                if field in ("csrf_token", "confirmed", "back", "action"):
+                    continue
+                rows.append((self.confirm_field_label(field), self.confirm_field_value(conn, field, value)))
+        back = self.back_path(data)
+        hidden = "".join(
+            f'<input type="hidden" name="{esc(field)}" value="{esc(value)}">'
+            for field, value in data.items() if field not in ("csrf_token", "back", "confirmed"))
+        summary = "".join(f"<tr><td>{esc(label)}</td><td>{esc(value)}</td></tr>" for label, value in rows)
+        table = (f"""<div class="table-wrap"><table><thead><tr><th>{esc(self.t('col.field'))}</th>
+        <th>{esc(self.t('col.value'))}</th></tr></thead><tbody>{summary}</tbody></table></div>"""
+                 if summary else "")
+        warning = f'<p class="warn">{esc(self.t("misc.confirm_irreversible"))}</p>' if danger else ""
+        body = f"""<h1>{esc(self.t('h1.confirm'))}</h1>
+        <div class="panel"><h2>{esc(self.t(question_key))}</h2>{warning}
+        {f'<h3>{esc(self.t("h2.confirm_details"))}</h3>' if table else ''}{table}
+        <br><form method="post" action="{esc(action)}">{self.csrf_input()}{hidden}
+        <input type="hidden" name="back" value="{esc(back)}"><input type="hidden" name="confirmed" value="1">
+        <button class="{'danger' if danger else ''}" type="submit">{esc(self.t('btn.confirm'))}</button>
+        <a class="button secondary" href="{esc(back)}">{esc(self.t('btn.cancel_action'))}</a></form></div>"""
+        # The language switcher links with GET; point it at the page the visitor
+        # came from, since this URL only answers POST.
+        self._switch_path = back
+        self.send_html(self.page(self.t("title.confirm"), body))
 
     def dashboard(self):
         with db() as conn:
@@ -2373,6 +2756,7 @@ class AppHandler(BaseHTTPRequestHandler):
             ).fetchall()
             base = get_setting(conn, "base_currency", "RUB")
             rates_updated = get_setting(conn, "rates_updated_at")
+            rates_error = get_setting(conn, "rates_last_error")
         active_codes = [c["code"] for c in currencies if c["is_active"]] or [base]
         base_options = "".join(
             f'<option value="{esc(c)}"{" selected" if c == base else ""}>{esc(c)}</option>'
@@ -2389,6 +2773,10 @@ class AppHandler(BaseHTTPRequestHandler):
                          f'<td><input type="checkbox" name="active_{esc(c["code"])}" value="1"{checked}></td></tr>')
         updated_line = (esc(self.t("misc.rates_updated_at", when=rates_updated)) if rates_updated
                         else esc(self.t("misc.rates_never")))
+        auto_line = (esc(self.t("misc.rates_auto", check=RATES_CHECK_MINUTES, hours=RATES_MAX_AGE_HOURS))
+                     if RATES_AUTO else esc(self.t("misc.rates_auto_off")))
+        error_line = (f'<p class="warn small">{esc(self.t("misc.rates_last_error", detail=rates_error))}</p>'
+                      if rates_error else "")
         body = f"""<div class="toolbar"><h1>{esc(self.t('h1.settings'))}</h1></div>
         <form method="post" action="/settings">{self.csrf_input()}
         <div class="panel"><h2>{esc(self.t('h2.base_currency'))}</h2>
@@ -2402,6 +2790,7 @@ class AppHandler(BaseHTTPRequestHandler):
         <br><button type="submit">{esc(self.t('btn.save_settings'))}</button></div></form><br>
         <div class="panel"><h2>{esc(self.t('h2.cbr_rates'))}</h2>
         <p class="muted small">{updated_line}</p>
+        <p class="muted small">{auto_line}</p>{error_line}
         <form method="post" action="/settings/refresh-rates">{self.csrf_input()}
         <button type="submit">{esc(self.t('btn.refresh_rates'))}</button></form></div>"""
         self.send_html(self.page(self.t('h1.settings'), body))
@@ -2421,14 +2810,13 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect("/settings", self.t("flash.settings_saved"))
 
     def refresh_rates_action(self, data):
-        # Fetch from the CBR before opening the write transaction so a slow or
-        # failing network call never holds the DB write lock.
+        # force=True: the button means "fetch now", even when the stored rates
+        # are still considered fresh. ensure_rates() handles the transaction and
+        # keeps the background refresher from fetching at the same moment.
         try:
-            rates = fetch_cbr_rates()
+            count = ensure_rates(force=True)
         except ValueError as exc:
             raise ValueError(self.t("error.cbr_fetch", detail=str(exc)))
-        with db(write=True) as conn:
-            count = refresh_rates(conn, fetch=lambda: rates)
         self.redirect("/settings", self.t("flash.rates_refreshed", count=count))
 
     def api_summary(self):
@@ -2494,12 +2882,19 @@ def main():
     init_db()
     apply_data_file_mode()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    # Started here rather than in init_db(): loading rates is a runtime job of
+    # the server process, and init_db() also runs in tests, which must not
+    # touch the network.
+    stop_rates = threading.Event()
+    if RATES_AUTO:
+        start_rate_refresher(stop_rates)
 
     def shutdown(signum, _frame):
         # shutdown() blocks until serve_forever() returns, and signal handlers
         # run on the thread already sitting in serve_forever(), so calling it
         # inline would deadlock. Hand it to a helper thread instead.
         print(f"{APP_NAME} received signal {signum}, shutting down")
+        stop_rates.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     # As PID 1 (the container entrypoint) a process gets no default action for
