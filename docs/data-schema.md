@@ -6,6 +6,15 @@
 
 ## ER-диаграмма
 
+Статичная копия для просмотрщиков без поддержки mermaid:
+[`data-schema.svg`](data-schema.svg). При изменении блока ниже её нужно
+перегенерировать:
+
+```sh
+sed -n '/^```mermaid$/,/^```$/p' docs/data-schema.md | sed '1d;$d' > /tmp/schema.mmd
+npx @mermaid-js/mermaid-cli -i /tmp/schema.mmd -o docs/data-schema.svg -b "#f6f8f5"
+```
+
 ```mermaid
 erDiagram
     budget_lines ||--o{ budget_operations : "источник (source_budget_id)"
