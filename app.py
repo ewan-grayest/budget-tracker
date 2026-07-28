@@ -7,7 +7,9 @@ import json
 import os
 import re
 import secrets
+import signal
 import sqlite3
+import threading
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from http import HTTPStatus
@@ -1467,20 +1469,24 @@ class AppHandler(BaseHTTPRequestHandler):
             for c in codes)
 
     def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        # Answered before the auth gate on purpose: the container HEALTHCHECK
+        # probes /healthz without credentials, so leaving it behind Basic Auth
+        # would flip the container to unhealthy as soon as APP_USER is set.
+        # It exposes nothing but liveness.
+        if path == "/healthz":
+            self.send_json({"status": "ok"}); return
         if not self._require_auth():
             return
         self.lang = self.resolve_lang()
         self._disp_loaded = False
-        parsed = urlparse(self.path)
-        path = parsed.path
         if path == "/static/style.css":
             body = CSS.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/css; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body); return
-        if path == "/healthz":
-            self.send_json({"status": "ok"}); return
         if path == "/api/summary":
             return self.api_summary()
         self.ensure_display_context()
@@ -2351,8 +2357,24 @@ class AppHandler(BaseHTTPRequestHandler):
 def main():
     init_db()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+
+    def shutdown(signum, _frame):
+        # shutdown() blocks until serve_forever() returns, and signal handlers
+        # run on the thread already sitting in serve_forever(), so calling it
+        # inline would deadlock. Hand it to a helper thread instead.
+        print(f"{APP_NAME} received signal {signum}, shutting down")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    # As PID 1 (the container entrypoint) a process gets no default action for
+    # signals it has not handled, so without these SIGTERM is ignored outright:
+    # `docker stop` would stall for its full timeout and then SIGKILL us in the
+    # middle of a SQLite write.
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
     print(f"{APP_NAME} listening on http://{HOST}:{PORT}; DB={DB_PATH}")
     server.serve_forever()
+    server.server_close()
 
 
 if __name__ == "__main__":

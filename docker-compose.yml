@@ -3,8 +3,13 @@ services:
     build: .
     container_name: budget-manager
     restart: unless-stopped
+    # Reaps orphans and forwards signals even if the entrypoint ever stops
+    # handling SIGTERM itself.
+    init: true
     ports:
-      - "8080:8080"
+      # Loopback only: Basic Auth sends credentials in cleartext, so anything
+      # beyond this host belongs behind a TLS-terminating reverse proxy.
+      - "127.0.0.1:8080:8080"
     environment:
       DB_PATH: /data/budget.db
       SEED_DEMO: "1"
@@ -13,6 +18,23 @@ services:
       # APP_PASSWORD: change-me
     volumes:
       - budget_data:/data
+    # The app writes only to /data; SQLite may want scratch space under /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    # Every request is logged to stdout, so cap the json-file driver or a
+    # long-running host fills its disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   budget_data:

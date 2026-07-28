@@ -1,0 +1,5 @@
+# The image needs app.py and nothing else (see Dockerfile). Excluding
+# everything by default keeps the build context tiny and guarantees a local
+# data/ directory with a real budget.db can never reach the daemon.
+*
+!app.py
