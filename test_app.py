@@ -5,6 +5,7 @@ Uses only the standard library (unittest), matching the app's zero-dependency
 design. Run with:  python3 -m unittest -v   (or)   python3 test_app.py
 """
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -403,6 +404,263 @@ class ConcurrencyTests(DBTestBase):
             m = app.budget_metrics(conn, bid)
         self.assertLessEqual(total, available)
         self.assertGreaterEqual(m["available"], 0)
+
+
+class HandbookTestBase(DBTestBase):
+    """Fixtures for the legal entity -> cost centre -> WBS -> cost element chain."""
+
+    def _add_le(self, code="RU12", name="Entity"):
+        with app.db(write=True) as conn:
+            return conn.execute(
+                "INSERT INTO legal_entities(code,name,created_at) VALUES(?,?,?)",
+                (code, name, "2026-01-01T00:00:00Z")).lastrowid
+
+    def _add_cc(self, le_id, code="RU12-IT", name="IT"):
+        with app.db(write=True) as conn:
+            return conn.execute(
+                "INSERT INTO cost_centers(code,name,legal_entity_id,created_at) VALUES(?,?,?,?)",
+                (code, name, le_id, "2026-01-01T00:00:00Z")).lastrowid
+
+    def _add_wbs(self, cc_id, code="IT/Infr/DC.DCT3srv", name="DC"):
+        with app.db(write=True) as conn:
+            return conn.execute(
+                "INSERT INTO wbs(code,name,cost_center_id,created_at) VALUES(?,?,?,?)",
+                (code, name, cc_id, "2026-01-01T00:00:00Z")).lastrowid
+
+    def _add_ce(self, code="6100100", name="IT services"):
+        with app.db(write=True) as conn:
+            return conn.execute(
+                "INSERT INTO cost_elements(code,name,created_at) VALUES(?,?,?)",
+                (code, name, "2026-01-01T00:00:00Z")).lastrowid
+
+    def _link_ce(self, wbs_id, ce_id):
+        with app.db(write=True) as conn:
+            conn.execute("INSERT INTO wbs_cost_elements(wbs_id,cost_element_id) VALUES(?,?)",
+                         (wbs_id, ce_id))
+
+    def _add_budget_on(self, wbs_id, code="B-WBS"):
+        with app.db(write=True) as conn:
+            return conn.execute(
+                """INSERT INTO budget_lines
+                (code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,
+                 currency,initial_approved_cents,initial_released_cents,created_at,wbs_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (code, "Name", 2026, "Holder", "", "", "", "", "EUR",
+                 1_000_000, 1_000_000, "2026-01-01T00:00:00Z", wbs_id)).lastrowid
+
+    def _chain(self):
+        """The whole chain in one call -> (le_id, cc_id, wbs_id, ce_id)."""
+        le = self._add_le()
+        cc = self._add_cc(le)
+        wbs = self._add_wbs(cc)
+        ce = self._add_ce()
+        self._link_ce(wbs, ce)
+        return le, cc, wbs, ce
+
+
+class CodeValidatorTests(unittest.TestCase):
+    def test_wbs_code_accepts_the_documented_shape(self):
+        for code in ("IT/Infr/DC.DCT3srv", "IT/Infr/DC", "a1/b-2/c_3.d-4"):
+            self.assertEqual(app.parse_wbs_code({"code": code}), code)
+
+    def test_wbs_code_rejects_wrong_segment_counts_and_junk(self):
+        for bad in ("IT/Infr", "IT", "IT/Infr/DC/X", "IT//DC", "IT/Infr/DC.",
+                    "IT/Infr/DC DCT", "", "   ", "IT\\Infr\\DC"):
+            with self.assertRaises(ValueError, msg=bad):
+                app.parse_wbs_code({"code": bad})
+
+    def test_wbs_code_is_required(self):
+        with self.assertRaises(ValueError):
+            app.parse_wbs_code({})
+
+    def test_entity_code_normalises_case(self):
+        self.assertEqual(app.parse_entity_code({"code": "ru12"}), "RU12")
+        self.assertEqual(app.parse_entity_code({"code": "  RU12 "}), "RU12")
+
+    def test_entity_code_rejects_slash_and_bad_length(self):
+        # A slash would make the full WBS ambiguous to read back apart.
+        for bad in ("RU/12", "R", "", "RU12345678901234567", "RU 12", "ru.12"):
+            with self.assertRaises(ValueError, msg=bad):
+                app.parse_entity_code({"code": bad})
+
+    def test_ref_code_accepts_dots_dashes_underscores(self):
+        for code in ("RU12-IT", "6100100", "a.b_c-d"):
+            self.assertEqual(app.parse_ref_code({"code": code}), code)
+
+    def test_ref_code_rejects_slash_and_spaces(self):
+        for bad in ("RU12/IT", "has space", "", "-leading", "x" * 33):
+            with self.assertRaises(ValueError, msg=bad):
+                app.parse_ref_code({"code": bad})
+
+    def test_full_wbs_composition(self):
+        self.assertEqual(app.full_wbs("RU12", "IT/Infr/DC.DCT3srv"),
+                         "RU12/IT/Infr/DC.DCT3srv")
+
+
+class HandbookSchemaTests(HandbookTestBase):
+    def test_codes_are_unique_within_each_handbook(self):
+        le = self._add_le()
+        cc = self._add_cc(le)
+        self._add_wbs(cc)
+        self._add_ce()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._add_le(code="RU12", name="other")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._add_cc(le, code="RU12-IT", name="other")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._add_wbs(cc, code="IT/Infr/DC.DCT3srv", name="other")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._add_ce(code="6100100", name="other")
+
+    def test_same_wbs_code_cannot_be_reused_under_another_entity(self):
+        # "A WBS without the legal entity is unique" -- so the code is taken
+        # globally, not once per entity.
+        le1 = self._add_le()
+        cc1 = self._add_cc(le1)
+        self._add_wbs(cc1)
+        cc2 = self._add_cc(self._add_le(code="RU13"), code="RU13-IT")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._add_wbs(cc2, code="IT/Infr/DC.DCT3srv")
+
+    def test_wbs_query_resolves_the_full_chain(self):
+        self._chain()
+        with app.db() as conn:
+            rows = app.wbs_query(conn)
+        self.assertEqual(len(rows), 1)
+        w = rows[0]
+        self.assertEqual(app.full_wbs(w["le_code"], w["code"]), "RU12/IT/Infr/DC.DCT3srv")
+        self.assertEqual(w["cc_code"], "RU12-IT")
+
+    def test_full_wbs_follows_a_renamed_entity(self):
+        le, _, wbs_id, _ = self._chain()
+        with app.db(write=True) as conn:
+            conn.execute("UPDATE legal_entities SET code='RU99' WHERE id=?", (le,))
+        with app.db() as conn:
+            w = app.wbs_row(conn, wbs_id)
+        self.assertEqual(app.full_wbs(w["le_code"], w["code"]), "RU99/IT/Infr/DC.DCT3srv")
+
+    def test_moving_a_cost_centre_changes_the_full_wbs(self):
+        _, _, wbs_id, _ = self._chain()
+        cc2 = self._add_cc(self._add_le(code="RU13"), code="RU13-IT")
+        with app.db(write=True) as conn:
+            conn.execute("UPDATE wbs SET cost_center_id=? WHERE id=?", (cc2, wbs_id))
+        with app.db() as conn:
+            w = app.wbs_row(conn, wbs_id)
+        self.assertEqual(app.full_wbs(w["le_code"], w["code"]), "RU13/IT/Infr/DC.DCT3srv")
+
+    def test_cost_elements_are_many_to_many(self):
+        _, cc, wbs1, ce1 = self._chain()
+        wbs2 = self._add_wbs(cc, code="IT/Infr/NW.Core", name="Network")
+        ce2 = self._add_ce(code="6200200", name="Consulting")
+        self._link_ce(wbs1, ce2)     # one WBS, two cost elements
+        self._link_ce(wbs2, ce1)     # one cost element, two WBS
+        with app.db() as conn:
+            self.assertEqual(app.wbs_ce_ids(conn, wbs1), {ce1, ce2})
+            self.assertEqual(app.wbs_ce_ids(conn, wbs2), {ce1})
+            labels = app.wbs_ce_labels(conn)
+        self.assertEqual(labels[wbs1], "6100100, 6200200")
+
+    def test_delete_guards_match_the_handlers(self):
+        le, cc, wbs_id, ce = self._chain()
+        self._add_budget_on(wbs_id)
+        with app.db() as conn:
+            self.assertTrue(conn.execute(
+                "SELECT COUNT(*) FROM cost_centers WHERE legal_entity_id=?", (le,)).fetchone()[0])
+            self.assertTrue(conn.execute(
+                "SELECT COUNT(*) FROM wbs WHERE cost_center_id=?", (cc,)).fetchone()[0])
+            self.assertTrue(conn.execute(
+                "SELECT COUNT(*) FROM budget_lines WHERE wbs_id=?", (wbs_id,)).fetchone()[0])
+            self.assertTrue(conn.execute(
+                """SELECT (SELECT COUNT(*) FROM wbs_cost_elements WHERE cost_element_id=?)
+                        + (SELECT COUNT(*) FROM budget_lines WHERE cost_element_id=?)""",
+                (ce, ce)).fetchone()[0])
+
+    def test_wbs_with_only_cost_element_links_is_deletable(self):
+        _, _, wbs_id, _ = self._chain()
+        # Mirror delete_wbs: CE links are attached data, not linked documents.
+        with app.db(write=True) as conn:
+            conn.execute("DELETE FROM wbs_cost_elements WHERE wbs_id=?", (wbs_id,))
+            conn.execute("DELETE FROM wbs WHERE id=?", (wbs_id,))
+        with app.db() as conn:
+            self.assertIsNone(app.wbs_row(conn, wbs_id))
+
+
+class HandbookMigrationTests(HandbookTestBase):
+    OLD_BUDGET_LINES = """
+        CREATE TABLE budget_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            fiscal_year INTEGER NOT NULL,
+            holder_name TEXT NOT NULL,
+            holder_email TEXT,
+            cost_center TEXT,
+            wbs TEXT,
+            cost_element TEXT,
+            currency TEXT NOT NULL DEFAULT 'EUR',
+            initial_approved_cents INTEGER NOT NULL CHECK(initial_approved_cents >= 0),
+            initial_released_cents INTEGER NOT NULL CHECK(initial_released_cents >= 0),
+            created_at TEXT NOT NULL
+        )"""
+
+    def _downgrade(self, rows):
+        """Rebuild budget_lines in its pre-handbook shape and fill it."""
+        with app.db(write=True) as conn:
+            conn.execute("DROP TABLE budget_lines")
+            conn.execute(self.OLD_BUDGET_LINES)
+            conn.executemany(
+                """INSERT INTO budget_lines
+                (code,name,fiscal_year,holder_name,holder_email,cost_center,wbs,cost_element,
+                 currency,initial_approved_cents,initial_released_cents,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(code, "Name", 2026, "Holder", "", cc, wbs, ce, "EUR",
+                  1_000_000, 1_000_000, "2026-01-01T00:00:00Z") for code, cc, wbs, ce in rows])
+
+    def test_init_db_adds_the_reference_columns_and_backfills(self):
+        self._chain()
+        self._downgrade([
+            ("MATCH", "RU12-IT", "IT/Infr/DC.DCT3srv", "6100100"),   # known codes
+            ("LEGACY", "CC-IT", "WBS-IT-OPS", "IT Services"),        # pre-format free text
+            ("BLANK", "", "", ""),
+        ])
+        with app.db() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(budget_lines)")}
+        self.assertNotIn("wbs_id", cols)  # precondition: the old shape really is old
+
+        app.init_db()  # an app restart on an older database
+
+        with app.db() as conn:
+            rows = {r["code"]: r for r in conn.execute(
+                "SELECT code,wbs_id,cost_element_id,wbs,cost_element FROM budget_lines")}
+            wbs_id = conn.execute("SELECT id FROM wbs").fetchone()[0]
+            ce_id = conn.execute("SELECT id FROM cost_elements").fetchone()[0]
+        self.assertEqual(rows["MATCH"]["wbs_id"], wbs_id)
+        self.assertEqual(rows["MATCH"]["cost_element_id"], ce_id)
+        # Unrecognised free text is left for a human to resolve rather than
+        # being auto-created as a dictionary entry.
+        self.assertIsNone(rows["LEGACY"]["wbs_id"])
+        self.assertIsNone(rows["LEGACY"]["cost_element_id"])
+        self.assertEqual(rows["LEGACY"]["wbs"], "WBS-IT-OPS")  # original text survives
+        self.assertIsNone(rows["BLANK"]["wbs_id"])
+
+    def test_init_db_is_idempotent_and_keeps_manual_edits(self):
+        _, _, wbs_id, _ = self._chain()
+        self._downgrade([("MATCH", "RU12-IT", "IT/Infr/DC.DCT3srv", "6100100")])
+        app.init_db()
+        with app.db(write=True) as conn:
+            conn.execute("UPDATE budget_lines SET wbs_id=NULL WHERE code='MATCH'")
+            conn.execute("UPDATE budget_lines SET wbs='' WHERE code='MATCH'")
+        app.init_db()  # a second restart must not resurrect a link from blank text
+        with app.db() as conn:
+            self.assertIsNone(
+                conn.execute("SELECT wbs_id FROM budget_lines WHERE code='MATCH'").fetchone()[0])
+
+    def test_ensure_column_is_a_no_op_when_present(self):
+        with app.db(write=True) as conn:
+            before = [r["name"] for r in conn.execute("PRAGMA table_info(budget_lines)")]
+            app.ensure_column(conn, "budget_lines", "wbs_id", "INTEGER REFERENCES wbs(id)")
+            after = [r["name"] for r in conn.execute("PRAGMA table_info(budget_lines)")]
+        self.assertEqual(before, after)
 
 
 class I18nTests(unittest.TestCase):
